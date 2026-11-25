@@ -16,8 +16,9 @@ described.
 
 ## Key findings
 
-All numbers are p50 latency on fixed 128-token batches, measured on the hardware below.
-Every variant was measured; none were skipped.
+Unless a bullet says otherwise, numbers are p50 latency on fixed 128-token batches,
+measured on the hardware below. Every variant was measured; none were skipped. The last
+group of bullets uses real SST-2 sentence lengths (dynamic padding).
 
 - **CPU: ONNX Runtime INT8 is the clear winner.**
   - **1.86× faster** than PyTorch FP32 at batch 1 (71.9 → 38.7 ms), 1.64× at batch 8 and
@@ -43,8 +44,22 @@ Every variant was measured; none were skipped.
     constraint.
 - **Accuracy holds everywhere.** All 7 variants score 91.06% on SST-2 validation, and every
   INT8/FP16 variant is within the configured tolerances.
+- **Padding to the longest sentence in each batch instead of to 128 tokens is the largest
+  single win.** SST-2 sentences average 25 tokens.
+  - For the same variant and batch size, p50 latency drops **2.5–4.6× on CPU** and
+    **1.8–2.8× on GPU** in FP32. These ratios compare against the fixed-padding run, which
+    was a separate run.
+  - At batch 1, ORT INT8 on CPU answers in **8.3 ms** (3.38× faster than PyTorch FP32's
+    28.2 ms), and ORT CUDA FP32 in **3.5 ms**. ORT's lead over PyTorch grows on short
+    inputs.
+  - **Larger batches carry more padding.** The mean padded length grows from 25 tokens at
+    batch 1 to 41 at batch 8 and 48 at batch 32. On CPU, throughput therefore *falls* with
+    batch size: ORT INT8 does 107.1 samples/s at batch 1 and 71.5 at batch 32. On GPU,
+    throughput levels off at batch 8 (ORT CUDA FP32: 459 vs 456 samples/s).
+  - FP16 is still slower than FP32 on this GPU at every batch size (0.22–0.58×).
 - **Recommendation for this machine:** ORT CUDA FP32 for GPU serving, and ORT INT8
-  (per-channel + `reduce_range`) for CPU serving.
+  (per-channel + `reduce_range`) for CPU serving. Pad per batch, not to a fixed length. On
+  CPU, keep batches small or group sentences of similar length.
 
 ---
 
@@ -70,14 +85,15 @@ python tasks.py doctor     # verify torch CUDA build + a real ORT CUDA session
 python tasks.py export     # FP32 ONNX (opset 17) + parity check on CPU and CUDA EPs
 python tasks.py quantize   # INT8 (dynamic) + FP16 graphs, verified on all of SST-2 validation
 python tasks.py benchmark  # all 7 variants, isolated workers; rewrites the tables below
+python tasks.py benchmark-dynamic  # same on real SST-2 lengths (dynamic padding), ~10 min
 python tasks.py profile    # torch.profiler Chrome trace + top-10 operators
-python tasks.py all        # doctor -> export -> quantize -> benchmark -> profile
+python tasks.py all        # doctor -> export -> quantize -> benchmark(-dynamic) -> profile
 ```
 
 Extra CLI flags go after `--`, e.g. `python tasks.py benchmark -- --variants ort-cpu-int8`.
 A subset or quick run (`--variants`, `--iters`, `--batch-sizes`, `--skip-eval`, ...) writes
-`results/benchmarks.partial.json` and leaves the published results and README untouched.
-Only a complete default run updates them.
+`results/benchmarks.partial.json` (or `benchmarks_dynamic.partial.json`) and leaves the
+published results and README untouched. Only a complete default run updates them.
 If you do have `make`, `make benchmark` and similar targets call the same tasks.
 
 ### CLI
@@ -88,10 +104,10 @@ If you do have `make`, `make benchmark` and similar targets call the same tasks.
 | `opt-pipeline predict [TEXT...]` | Classifies sentences with the PyTorch baseline (`--device`, `--precision`) |
 | `opt-pipeline export` | Exports ONNX (`--exporter torchscript\|dynamo`, `--opset`), then checks parity on CPU and CUDA |
 | `opt-pipeline quantize` | Builds the INT8 and FP16 graphs and checks agreement with FP32 on SST-2 (`--skip-int8`, `--skip-fp16`) |
-| `opt-pipeline benchmark` | Measures latency, throughput, memory, size and accuracy (`--variants`, `--batch-sizes`, `--iters`, `--no-isolate`, `--update-readme`) |
+| `opt-pipeline benchmark` | Measures latency, throughput, memory, size and accuracy (`--padding max_length\|dynamic`, `--variants`, `--batch-sizes`, `--iters`, `--no-isolate`, `--update-readme`) |
 | `opt-pipeline profile` | Runs `torch.profiler` and prints the top operators by self time (`--device`, `--precision`, `--batch-size`) |
 | `opt-pipeline evaluate` | Reports SST-2 accuracy, F1 and label agreement per variant (in-process) |
-| `opt-pipeline report` | Re-renders `results/benchmarks.md` and the README tables from the JSON |
+| `opt-pipeline report` | Re-renders `results/*.md` and the README tables from each results JSON (`--input` for one file) |
 
 Variants: `pytorch-cpu-fp32`, `ort-cpu-fp32`, `ort-cpu-int8`, `pytorch-cuda-fp32`,
 `pytorch-cuda-fp16`, `ort-cuda-fp32`, `ort-cuda-fp16`.
@@ -149,10 +165,92 @@ _Generated 2026-11-25T08:09:32+00:00 from `results/benchmarks.json` (schema v1).
 | `ort-cuda-fp16` | CUDAExecutionProvider | 127.9 | 91.06% | 0.9137 | +0.00 pp | 100.00% | ✅ |
 <!-- BENCHMARKS:END -->
 
+### Dynamic padding (real SST-2 lengths)
+
+The tables above pad every batch to 128 tokens. SST-2 validation sentences average 25
+tokens, and the longest is 55, so at fixed 128 about 80% of every batch is padding.
+`python tasks.py benchmark-dynamic` times the same variants on real sentences. It draws
+100 batches per batch size from the validation split, seeded so every variant gets the
+same batches, and pads each batch only to its own longest sentence. Results go to
+`results/benchmarks_dynamic.json`, and the published fixed-padding results stay as they
+are.
+
+<!-- BENCHMARKS-DYNAMIC:START -->
+_Generated 2026-11-25T09:25:58+00:00 from `results/benchmarks_dynamic.json` (schema v2). CPU: Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz (4C/8T, 19.8 GB RAM, on AC power). GPU: NVIDIA GeForce GTX 1650 Ti (4096 MB, driver 591.59). torch 2.14.1+cu126, onnxruntime 1.26.0. 100 timed batches per cell, drawn (seed 42) from the validation sentences; each batch is padded to its longest sentence._
+
+#### Workload (identical for every variant)
+
+| Batch | Padded length: mean / p50 / max | Real tokens per sentence | Real share of padded tokens | Real share at fixed 128 |
+|---:|---:|---:|---:|---:|
+| 1 | 25.1 / 24 / 52 | 25.1 | 100.0% | 19.6% |
+| 8 | 41.2 / 41 / 55 | 25.3 | 61.3% | 19.7% |
+| 32 | 47.5 / 48 / 55 | 25.2 | 53.0% | 19.7% |
+
+#### CPU latency & throughput (dynamic padding)
+
+| Variant | Batch | p50 (ms) | p95 (ms) | p99 (ms) | Throughput (samples/s) | Speed-up vs PyTorch FP32 (p50) | Speed-up vs 128-token padding (p50) | Peak RAM Δ (MB) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `pytorch-cpu-fp32` | 1 | 28.19 | 33.93 | 37.94 | 35.1 | 1.00× | 2.55× | 293 |
+| `pytorch-cpu-fp32` | 8 | 160.98 | 205.07 | 225.40 | 49.2 | 1.00× | 3.36× | 318 |
+| `pytorch-cpu-fp32` | 32 | 655.72 | 817.22 | 857.44 | 48.2 | 1.00× | 2.91× | 387 |
+| `ort-cpu-fp32` | 1 | 15.82 | 22.30 | 24.56 | 62.6 | 1.78× | 3.63× | 281 |
+| `ort-cpu-fp32` | 8 | 132.93 | 179.27 | 187.02 | 59.5 | 1.21× | 3.66× | 307 |
+| `ort-cpu-fp32` | 32 | 672.35 | 813.69 | 845.21 | 47.2 | 0.98× | 3.07× | 391 |
+| `ort-cpu-int8` | 1 | 8.34 | 13.96 | 22.68 | 107.1 | 3.38× | 4.64× | 92 |
+| `ort-cpu-int8` | 8 | 91.54 | 120.20 | 130.43 | 86.5 | 1.76× | 3.60× | 109 |
+| `ort-cpu-int8` | 32 | 445.99 | 525.14 | 534.73 | 71.5 | 1.47× | 3.13× | 168 |
+
+#### GPU latency & throughput (dynamic padding)
+
+| Variant | Batch | p50 (ms) | p95 (ms) | p99 (ms) | Throughput (samples/s) | Speed-up vs PyTorch FP32 (p50) | Speed-up vs 128-token padding (p50) | VRAM device Δ (MB) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `pytorch-cuda-fp32` | 1 | 5.02 | 6.43 | 6.92 | 188.5 | 1.00× | 1.81× | 368 |
+| `pytorch-cuda-fp32` | 8 | 20.42 | 22.22 | 22.41 | 399.7 | 1.00× | 2.51× | 372 |
+| `pytorch-cuda-fp32` | 32 | 79.71 | 97.55 | 98.37 | 395.0 | 1.00× | 2.82× | 458 |
+| `pytorch-cuda-fp16` | 1 | 8.66 | 13.69 | 14.11 | 107.4 | 0.58× | 4.02× | 222 |
+| `pytorch-cuda-fp16` | 8 | 92.25 | 107.51 | 107.63 | 89.5 | 0.22× | 2.36× | 228 |
+| `pytorch-cuda-fp16` | 32 | 332.84 | 397.49 | 397.65 | 93.0 | 0.24× | 2.59× | 264 |
+| `ort-cuda-fp32` | 1 | 3.47 | 6.47 | 8.19 | 261.5 | 1.45× | 2.02× | 582 |
+| `ort-cuda-fp32` | 8 | 16.84 | 23.44 | 23.72 | 458.9 | 1.21× | 2.56× | 582 |
+| `ort-cuda-fp32` | 32 | 71.56 | 84.67 | 85.00 | 455.6 | 1.11× | 2.77× | 582 |
+| `ort-cuda-fp16` | 1 | 13.09 | 14.97 | 15.33 | 75.9 | 0.38× | 2.21× | 324 |
+| `ort-cuda-fp16` | 8 | 90.15 | 111.75 | 111.79 | 93.3 | 0.23× | 2.44× | 324 |
+| `ort-cuda-fp16` | 32 | 346.64 | 381.51 | 386.97 | 91.8 | 0.23× | 2.53× | 326 |
+
+The fixed-padding p50 comes from `results/benchmarks.json` (generated 2026-11-25T08:09:32+00:00), a separate run. The ratios therefore include drift between runs, which has reached about 8% on this laptop's CPU, so they are reliable for the multi-fold effects of padding but not for small differences.
+Accuracy does not depend on the benchmark padding mode, because evaluation always pads dynamically. This run re-measured 91.06% for every variant.
+<!-- BENCHMARKS-DYNAMIC:END -->
+
+What the dynamic-padding run shows:
+
+1. **Shorter inputs help the CPU most.** CPU latency falls 2.5–4.6×, roughly in line with
+   the 2.7–5.1× fewer padded tokens per batch (128 divided by the mean padded length). On
+   the GPU the gain is smaller at batch 1: 1.8× for PyTorch CUDA FP32 (9.1 → 5.0 ms),
+   despite 5× fewer tokens. That is consistent with fixed per-call costs (kernel launches,
+   host-device copies, Python dispatch) taking over once the GEMMs shrink. This is an
+   inference, not a measurement: the profile above uses 128-token batches.
+2. **ORT's advantage grows on short inputs.** At batch 1, ORT FP32 on CPU is 1.78× faster
+   than PyTorch (1.25× at 128 tokens). ORT INT8 is 3.38× faster (1.86×), and ORT CUDA FP32
+   1.45× (1.30×). A likely explanation is that each framework's fixed per-call overhead is a
+   larger share of a shorter call. That hasn't been profiled.
+3. **Batching stops paying.** Each batch is padded to its longest member, so larger
+   batches carry more padding: 39% of every padded batch at batch 8 and 47% at batch 32.
+   On CPU, the best throughput comes from batch 1 for both ORT variants and from batch 8
+   for PyTorch. On the GPU, batch 8 and batch 32 give the same throughput. Grouping
+   sentences of similar length before batching would recover most of that padding.
+4. **Tails now include real length variation.** Every iteration has a different shape, so
+   p95/p99 reflect long sentences as well as system jitter. ORT INT8 at batch 1 has a p50
+   of 8.3 ms and a p99 of 22.7 ms. In the fixed-shape tables, the spread is jitter only.
+5. **FP16 stays slower than FP32 on this GPU** at every batch size (0.22–0.58×). The gap
+   narrows only for PyTorch at batch 1. This run didn't investigate FP16 further.
+6. **Every variant ran identical work.** Each worker rebuilds the batches from the seed,
+   and the results record a sha256 of every timed batch's token ids and mask. Validation
+   rejects a results file whose variants don't share it.
+
 ### Methodology
 
-Each number in the tables is measured as follows. The same description is stored in
-`benchmarks.json` under `methodology`.
+Each number in the tables is measured as follows. The same description is stored in each
+results file (`benchmarks.json`, `benchmarks_dynamic.json`) under `methodology`.
 
 - **Isolation.** Each variant runs in a fresh subprocess. Peak RAM, the CUDA context,
   allocator caches and thread pools never carry over between variants. A failing variant is
@@ -161,14 +259,26 @@ Each number in the tables is measured as follows. The same description is stored
   identically for every backend. PyTorch pays its host-to-device copy and device-to-host
   readback exactly as ONNX Runtime does. Tokenisation is excluded because it's identical
   for all variants. PyTorch CUDA iterations end with `torch.cuda.synchronize()`.
-- **Shapes.** Timed batches are padded to a fixed `max_length = 128` tokens, so every
-  variant does exactly the same work. This is the worst case for SST-2, whose sentences
-  average about 25 tokens.
-- **Warmup.** 3 untimed memory-measurement iterations, then 10 untimed warmup iterations,
-  then 100 timed iterations with Python's garbage collector disabled. Seeds are fixed, and
+- **Shapes.** There are two padding modes.
+  - *Fixed* (`benchmark`): one batch padded to `max_length = 128` tokens, repeated for every
+    iteration. Every variant does exactly the same work. This is the worst case for SST-2,
+    whose sentences average about 25 tokens.
+  - *Dynamic* (`benchmark-dynamic`): 100 distinct batches per batch size, drawn from the
+    SST-2 validation sentences with a fixed seed. Each batch is padded to its own longest
+    sentence. Every worker rebuilds the same batches, and the results store a sha256 of
+    them; validation fails if variants differ.
+- **Warmup.** First an untimed shape pass: one iteration per distinct padded length,
+  longest first, at least 3. For the fixed mode that is 3 iterations of the one shape; the
+  dynamic mode has 18–35 shapes per batch size. The pass moves per-shape kernel selection
+  and allocator-arena growth out of the timed loop. Then come 10 untimed warmup iterations
+  and 100 timed iterations, with Python's garbage collector disabled. Seeds are fixed, and
   deterministic-algorithm mode is off for benchmarking.
-- **RAM.** Peak RSS, sampled every 2 ms during the *untimed* pass, minus RSS before the
-  model was loaded. The sampler thread never runs alongside the timed loop.
+- **Percentiles.** In the fixed mode, the p95/p99 spread is system jitter only. In the
+  dynamic mode it also includes real variation in sentence length.
+- **RAM.** Peak RSS, sampled every 2 ms during the *untimed* shape pass, minus RSS before
+  the model was loaded. The sampler thread never runs alongside the timed loop. In the
+  dynamic mode, the dataset is loaded before that baseline, so it isn't counted as model
+  memory.
 - **VRAM.** Two measurements, because they see different things:
   - *Device Δ*: `cudaMemGetInfo` used memory minus a baseline taken after the worker's CUDA
     context exists. It sees every runtime's allocations, so it is comparable across backends.
@@ -285,7 +395,10 @@ Possible follow-ups, not yet measured:
 - Force non-tensor-op FP16 GEMMs and check whether TU117's native 2:1 FP16 rate appears.
 - Use ORT's fused transformer optimizer (`onnxruntime.transformers.optimizer`) as a
   separately labelled variant.
-- Benchmark dynamic padding, i.e. realistic sequence lengths around 25 tokens rather than 128.
+- Profile batch 1 at real SST-2 lengths to confirm where the time goes once the GEMMs
+  shrink.
+- Group sentences of similar length before batching (length bucketing). With dynamic
+  padding, 47% of a batch-32 batch is still padding (see "Dynamic padding" above).
 
 ---
 
@@ -321,14 +434,15 @@ src/opt_pipeline/
   quantize.py            INT8 dynamic quantization, FP16 conversion, agreement vs FP32 reference
   runners.py             Variant registry + uniform host-to-host Runner over PyTorch / ORT
   evaluate.py            SST-2 loading, accuracy / F1 / label agreement
-  benchmark.py           Latency / throughput / memory measurement, isolated workers,
-                         results schema, Markdown report
+  benchmark.py           Fixed / dynamic-padding workloads, latency / throughput / memory
+                         measurement, isolated workers, results schema, Markdown report
   profile_bottlenecks.py torch.profiler trace + top-N operators
   cli.py                 `opt-pipeline` CLI
 tests/
   test_parity.py         Shapes, FP32 equivalence, dynamic seq len, INT8/FP16 tolerance,
                          CUDA EP, dynamo exporter
-  test_benchmark.py      Latency/memory collection, JSON schema, comparisons, report, config
+  test_benchmark.py      Latency/memory collection, workloads, JSON schema, comparisons,
+                         report, config, CLI, LF output
 scripts/int8_sweep.py    Reproduces the INT8 settings sweep -> results/int8_sweep.json
 tasks.py                 Cross-platform task runner (make replacement)
 Makefile                 Thin wrapper around tasks.py
@@ -338,13 +452,13 @@ Generated and git-ignored: `.venv/`, `models/` (HF model cache), `data/` (proces
 Arrow cache), and `artifacts/` (ONNX graphs, profiler traces, worker logs). The raw SST-2
 parquet files (~3 MB) always go to the shared `~/.cache/huggingface/hub`; datasets 5.x
 ignores `DownloadConfig.cache_dir` for Hub files. `results/` is tracked: `benchmarks.json`
-(+ `.md`), `evaluation.json` and `int8_sweep.json`.
+and `benchmarks_dynamic.json` (each + `.md`), `evaluation.json` and `int8_sweep.json`.
 
 ## Testing
 
 ```bash
-python tasks.py test-fast   # 31 fast tests: metrics, schema, report, config, CLI (~3 s, no model)
-python tasks.py test        # all 60: + export, INT8/FP16 parity, GPU, worker, profiler (~2 min)
+python tasks.py test-fast   # 54 fast tests: metrics, workloads, schema, report, config, CLI (~6 s)
+python tasks.py test        # all 84: + export, INT8/FP16 parity, GPU, workers, profiler (~3 min)
 python tasks.py check       # ruff + mypy --strict + full pytest
 ```
 

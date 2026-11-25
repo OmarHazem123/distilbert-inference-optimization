@@ -31,6 +31,7 @@ __all__ = [
     "ConfigError",
     "DeviceName",
     "ExporterName",
+    "PaddingMode",
     "PathsConfig",
     "PipelineConfig",
     "Precision",
@@ -45,6 +46,15 @@ ExporterName = Literal["torchscript", "dynamo"]
 path: it emits opset 17 natively and honours ``dynamic_axes``. ``dynamo`` is
 the ``torch.export``-based exporter; it builds at opset 18 and down-converts to
 the requested opset (verified to reach 17 for this model)."""
+
+PaddingMode = Literal["max_length", "dynamic"]
+"""How timed benchmark batches are shaped.
+
+``max_length`` pads every batch to ``max_seq_length`` (one fixed shape: every
+variant does identical, worst-case work). ``dynamic`` times real SST-2
+validation sentences, each batch padded only to its own longest sentence --
+the shapes a serving system actually sees. Accuracy evaluation always uses
+dynamic padding, whatever this is set to."""
 
 DeviceName = Literal["auto", "cpu", "cuda"]
 """Execution target: ``auto`` picks CUDA when available, otherwise CPU."""
@@ -165,6 +175,15 @@ class PathsConfig:
         return self.results_dir / "benchmarks.md"
 
     @property
+    def benchmarks_dynamic_json(self) -> Path:
+        """Dynamic-padding benchmark results (kept apart from the fixed-shape run)."""
+        return self.results_dir / "benchmarks_dynamic.json"
+
+    def benchmark_results_json(self, padding: PaddingMode) -> Path:
+        """Canonical results file for a benchmark run with ``padding``."""
+        return self.benchmarks_json if padding == "max_length" else self.benchmarks_dynamic_json
+
+    @property
     def evaluation_json(self) -> Path:
         """Accuracy / F1 results of the ``evaluate`` command."""
         return self.results_dir / "evaluation.json"
@@ -214,6 +233,7 @@ class PipelineConfig:
         max_seq_length: Tokenizer truncation length and benchmark sequence
             length. SST-2 sentences are short; 128 covers >99% of them.
         batch_sizes: Batch sizes to benchmark, stored sorted and de-duplicated.
+        padding: Shape of the timed benchmark batches (see :data:`PaddingMode`).
         warmup_runs: Untimed iterations per configuration (CUDA context, cuDNN
             autotuning, ORT arena growth, CPU caches).
         benchmark_iters: Timed iterations per configuration; p99 needs >= 100
@@ -239,6 +259,7 @@ class PipelineConfig:
     revision: str = DEFAULT_MODEL_REVISION
     max_seq_length: int = 128
     batch_sizes: tuple[int, ...] = (1, 8, 32)
+    padding: PaddingMode = "max_length"
     warmup_runs: int = 10
     benchmark_iters: int = 100
     seed: int = 42
@@ -267,6 +288,7 @@ class PipelineConfig:
         _require(self.max_seq_length > 0, "max_seq_length must be > 0")
         _require(len(sizes) > 0, "batch_sizes must contain at least one value")
         _require(all(b > 0 for b in sizes), f"batch sizes must be > 0, got {sizes}")
+        _require(self.padding in ("max_length", "dynamic"), f"invalid padding {self.padding!r}")
         _require(self.warmup_runs >= 0, "warmup_runs must be >= 0")
         _require(self.benchmark_iters > 0, "benchmark_iters must be > 0")
         _require(self.seed >= 0, "seed must be >= 0")

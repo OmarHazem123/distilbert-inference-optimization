@@ -5,10 +5,11 @@ Commands:
     predict   Classify sentences with the PyTorch baseline (sanity check).
     export    Export FP32 ONNX (opset 17, dynamic axes) and verify parity.
     quantize  Build INT8 (dynamic) and FP16 graphs and verify them on SST-2.
-    benchmark Latency / throughput / memory / size / accuracy for all variants.
+    benchmark Latency / throughput / memory / size / accuracy for all variants
+              (``--padding dynamic``: real SST-2 sentence lengths).
     profile   torch.profiler trace + top-10 operators of the PyTorch baseline.
     evaluate  SST-2 validation accuracy / F1 / label agreement per variant.
-    report    Re-render the Markdown tables (and README) from benchmarks.json.
+    report    Re-render the Markdown tables (and README) from the results JSON files.
 
 Heavy imports (torch, onnxruntime, transformers) happen inside each command so
 ``--help`` stays fast.
@@ -68,6 +69,7 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         opset_version=getattr(args, "opset", None),
         exporter=getattr(args, "exporter", None),
         batch_sizes=getattr(args, "batch_sizes", None),
+        padding=getattr(args, "padding", None),
         benchmark_iters=getattr(args, "iters", None),
         warmup_runs=getattr(args, "warmup", None),
         eval_max_samples=getattr(args, "max_samples", None),
@@ -245,14 +247,18 @@ def _cmd_quantize(args: argparse.Namespace) -> int:
 
 
 def is_canonical_benchmark(args: argparse.Namespace, cfg: PipelineConfig) -> bool:
-    """True only for a complete, default-configuration benchmark.
+    """True only for a complete, default-configuration benchmark (either padding mode).
 
-    Only such a run may overwrite the tracked ``results/benchmarks.json`` or the
+    Only such a run may overwrite its tracked results file
+    (``results/benchmarks.json`` or ``results/benchmarks_dynamic.json``) or its
     README tables -- a ``--variants`` subset or a quick ``--iters 5`` run would
     otherwise silently replace the published 7-variant results.
     """
     return (
-        not args.variants and not args.skip_eval and not args.no_isolate and cfg == PipelineConfig()
+        not args.variants
+        and not args.skip_eval
+        and not args.no_isolate
+        and cfg.with_overrides(padding="max_length") == PipelineConfig()
     )
 
 
@@ -261,9 +267,10 @@ def benchmark_output_path(args: argparse.Namespace, cfg: PipelineConfig) -> Path
     if args.output is not None:
         output: Path = args.output
         return output
+    canonical = cfg.paths.benchmark_results_json(cfg.padding)
     if is_canonical_benchmark(args, cfg):
-        return cfg.paths.benchmarks_json
-    return cfg.paths.benchmarks_json.with_name("benchmarks.partial.json")
+        return canonical
+    return canonical.with_name(f"{canonical.stem}.partial.json")
 
 
 def _cmd_benchmark(args: argparse.Namespace) -> int:
@@ -347,10 +354,14 @@ def _cmd_report(args: argparse.Namespace) -> int:
     from opt_pipeline.benchmark import load_results, write_report
 
     cfg = _config_from_args(args)
-    source: Path = args.input or cfg.paths.benchmarks_json
-    payload = load_results(source)
+    if args.input is not None:
+        sources: list[Path] = [args.input]
+    else:  # every canonical results file that exists (fixed first, then dynamic)
+        canonical = [cfg.paths.benchmark_results_json(p) for p in ("max_length", "dynamic")]
+        sources = [p for p in canonical if p.exists()] or canonical[:1]
     readme = args.readme if args.update_readme else None
-    print(write_report(payload, source.with_suffix(".md"), readme=readme))
+    for source in sources:
+        print(write_report(load_results(source), source.with_suffix(".md"), readme=readme))
     return 0
 
 
@@ -405,12 +416,22 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("benchmark", parents=[common], help="benchmark all variants")
     p.add_argument("--variants", nargs="+", metavar="NAME", help=VARIANTS_HELP)
     p.add_argument("--batch-sizes", type=int, nargs="+", help="batch sizes (default 1 8 32)")
+    p.add_argument(
+        "--padding",
+        choices=["max_length", "dynamic"],
+        help="timed batches: fixed 128-token padding (default) or real SST-2 sentences padded "
+        "per batch (writes results/benchmarks_dynamic.json)",
+    )
     p.add_argument("--iters", type=int, help="timed iterations per cell (default 100)")
     p.add_argument("--warmup", type=int, help="untimed warmup iterations (default 10)")
     p.add_argument("--max-samples", type=int, help="cap SST-2 evaluation sentences")
     p.add_argument("--skip-eval", action="store_true", help="skip SST-2 accuracy / F1")
     p.add_argument("--no-isolate", action="store_true", help="run variants in-process")
-    p.add_argument("--output", type=Path, help="results JSON (default results/benchmarks.json)")
+    p.add_argument(
+        "--output",
+        type=Path,
+        help="results JSON (default results/benchmarks.json or benchmarks_dynamic.json)",
+    )
     p.add_argument("--update-readme", action="store_true", help="splice tables into README")
     p.add_argument("--readme", type=Path, default=DEFAULT_README, help=argparse.SUPPRESS)
     p.set_defaults(func=_cmd_benchmark)
@@ -431,8 +452,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path, help="JSON output (default results/evaluation.json)")
     p.set_defaults(func=_cmd_evaluate)
 
-    p = sub.add_parser("report", help="re-render Markdown tables from benchmarks.json")
-    p.add_argument("--input", type=Path, help="results JSON (default results/benchmarks.json)")
+    p = sub.add_parser("report", help="re-render Markdown tables from the results JSON")
+    p.add_argument(
+        "--input",
+        type=Path,
+        help="results JSON (default: benchmarks.json and, if present, benchmarks_dynamic.json)",
+    )
     p.add_argument("--update-readme", action="store_true", help="splice tables into README")
     p.add_argument("--readme", type=Path, default=DEFAULT_README, help=argparse.SUPPRESS)
     p.set_defaults(func=_cmd_report)

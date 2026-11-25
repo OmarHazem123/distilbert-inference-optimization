@@ -10,11 +10,18 @@ Methodology (also recorded in every ``benchmarks.json``):
   and device->host readback exactly like ONNX Runtime does. Tokenisation is
   excluded (identical for all variants). CUDA timings bracket each iteration
   with ``torch.cuda.synchronize()``.
-* **Shapes** -- fixed ``(batch, max_seq_length)`` batches padded to
-  ``max_length`` so every variant computes exactly the same work.
-* **Warmup** -- a short untimed memory-measurement pass, then
-  ``cfg.warmup_runs`` untimed iterations, then ``cfg.benchmark_iters`` timed
-  iterations with the garbage collector disabled.
+* **Shapes** -- ``cfg.padding`` selects the workload. ``max_length``: one
+  fixed ``(batch, max_seq_length)`` batch, repeated (worst-case, identical
+  work). ``dynamic``: ``cfg.benchmark_iters`` distinct batches of real SST-2
+  validation sentences, each padded to its own longest sentence. Either way
+  the workload is rebuilt deterministically in every worker and fingerprinted
+  (sha256 of all token ids and masks); results whose variants were timed on
+  different workloads fail validation.
+* **Warmup** -- an untimed shape pass (one iteration per distinct padded
+  length, longest first, at least ``MEMORY_PASS_ITERATIONS``) so per-shape
+  kernel selection and allocator-arena growth happen outside the timed loop,
+  then ``cfg.warmup_runs`` untimed iterations, then ``cfg.benchmark_iters``
+  timed iterations with the garbage collector disabled.
 * **Memory** -- measured in the untimed pass, never alongside the timed loop:
   sampled peak RSS (psutil); for CUDA, ``torch.cuda.max_memory_allocated`` /
   ``max_memory_reserved`` (PyTorch only -- ONNX Runtime allocations are
@@ -28,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import platform
@@ -38,7 +46,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from itertools import cycle, islice
 from pathlib import Path
@@ -50,6 +58,7 @@ import psutil
 
 from opt_pipeline import __version__
 from opt_pipeline.baseline import (
+    MODEL_INPUT_NAMES,
     Encoded,
     TorchClassifier,
     encode,
@@ -57,8 +66,8 @@ from opt_pipeline.baseline import (
     load_tokenizer,
     seed_everything,
 )
-from opt_pipeline.config import PipelineConfig
-from opt_pipeline.errors import MissingArtifactError, PipelineError
+from opt_pipeline.config import PaddingMode, PipelineConfig
+from opt_pipeline.errors import ConfigError, MissingArtifactError, PipelineError
 from opt_pipeline.evaluate import LabeledSplit, evaluate_runner, label_agreement, load_sst2
 from opt_pipeline.export_onnx import PARITY_TEXTS
 from opt_pipeline.runners import (
@@ -74,13 +83,21 @@ from opt_pipeline.utils import atomic_write_json, atomic_write_text, file_size_m
 
 log = get_logger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
+"""Version 2 adds a per-result ``workload`` block (padding, sequence-length
+statistics, fingerprint). Version 1 files -- written before dynamic padding
+existed -- still validate and render."""
 _MB = 1024 * 1024
 MEMORY_PASS_ITERATIONS = 3
-"""Untimed iterations run under the RSS sampler before the timed loop."""
+"""Minimum untimed shape-pass iterations, run under the RSS sampler."""
 
-README_START = "<!-- BENCHMARKS:START -->"
-README_END = "<!-- BENCHMARKS:END -->"
+README_MARKERS: dict[str, tuple[str, str]] = {
+    "max_length": ("<!-- BENCHMARKS:START -->", "<!-- BENCHMARKS:END -->"),
+    "dynamic": ("<!-- BENCHMARKS-DYNAMIC:START -->", "<!-- BENCHMARKS-DYNAMIC:END -->"),
+}
+"""README marker pair each padding mode's generated tables live between."""
+README_START, README_END = README_MARKERS["max_length"]
 
 
 # ==========================================================================
@@ -253,7 +270,12 @@ class CudaMemoryProbe:
 # ==========================================================================
 @dataclass(frozen=True, slots=True)
 class BatchResult:
-    """All measurements for one (variant, batch size)."""
+    """All measurements for one (variant, batch size).
+
+    ``sequence_length`` is the *longest* padded length that was timed (equal to
+    ``max_seq_length`` for fixed padding); ``workload`` holds the full
+    sequence-length statistics and the workload fingerprint.
+    """
 
     batch_size: int
     sequence_length: int
@@ -266,12 +288,80 @@ class BatchResult:
     vram_torch_allocated_peak_mb: float | None
     vram_torch_reserved_peak_mb: float | None
     vram_device_delta_mb: float | None
+    workload: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serialisable view."""
         out = asdict(self)
         out["latency_ms"] = self.latency_ms.to_dict()
         return out
+
+
+# ==========================================================================
+# Workloads (what is timed)
+# ==========================================================================
+@dataclass(frozen=True, slots=True)
+class Workload:
+    """The exact pre-tokenised batches one (variant, batch size) cell is timed on.
+
+    Timed iteration ``i`` runs ``batches[i % len(batches)]``: fixed padding has
+    one batch repeated; dynamic padding has one distinct batch per iteration.
+    """
+
+    padding: PaddingMode
+    batches: tuple[Encoded, ...]
+
+    def __post_init__(self) -> None:
+        if not self.batches:
+            raise ValueError("a workload needs at least one batch")
+        sizes = {int(b["input_ids"].shape[0]) for b in self.batches}
+        if len(sizes) != 1:
+            raise ValueError(f"all batches must share one batch size, got {sorted(sizes)}")
+
+    @property
+    def batch_size(self) -> int:
+        """Rows per batch."""
+        return int(self.batches[0]["input_ids"].shape[0])
+
+    def shape_pass(self) -> list[Encoded]:
+        """One batch per distinct padded length, longest first.
+
+        Running these untimed before warmup moves per-shape costs (oneDNN
+        primitive creation, cuBLAS heuristics, allocator-arena growth) out of
+        the timed loop, and the longest batch sets the memory peak.
+        """
+        by_length: dict[int, Encoded] = {}
+        for batch in self.batches:
+            by_length.setdefault(int(batch["input_ids"].shape[1]), batch)
+        return [by_length[n] for n in sorted(by_length, reverse=True)]
+
+    def sha256(self) -> str:
+        """Fingerprint of every batch's shapes, token ids and attention mask."""
+        digest = hashlib.sha256()
+        for batch in self.batches:
+            for name in MODEL_INPUT_NAMES:
+                array = np.ascontiguousarray(batch[name], dtype=np.int64)
+                digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+                digest.update(array.tobytes())
+        return digest.hexdigest()
+
+    def summary(self, iterations: int) -> dict[str, Any]:
+        """Statistics of the ``iterations`` batches the timed loop runs."""
+        timed = [self.batches[i % len(self.batches)] for i in range(iterations)]
+        lengths = np.array([b["input_ids"].shape[1] for b in timed], dtype=np.float64)
+        real = sum(int(b["attention_mask"].sum()) for b in timed)
+        padded = sum(int(b["attention_mask"].size) for b in timed)
+        return {
+            "padding": self.padding,
+            "distinct_batches": len(self.batches),
+            "distinct_shapes": len(set(lengths.tolist())),
+            "seq_len_mean": float(lengths.mean()),
+            "seq_len_p50": float(np.percentile(lengths, 50)),
+            "seq_len_max": int(lengths.max()),
+            "mean_real_tokens": real / (len(timed) * self.batch_size),
+            "real_token_fraction": real / padded,
+            "sha256": self.sha256(),
+        }
 
 
 def make_batch(
@@ -282,9 +372,70 @@ def make_batch(
     return encode(tokenizer, chosen, max_length=max_length, padding="max_length")
 
 
-def measure_batch(
+def dynamic_workload(
+    tokenizer: Any,
+    sentences: Sequence[str],
+    *,
+    batch_size: int,
+    n_batches: int,
+    max_length: int,
+    seed: int,
+) -> Workload:
+    """``n_batches`` batches of real sentences, each padded to its longest member.
+
+    Sentences are taken in order from successive seeded permutations of
+    ``sentences``; when fewer than ``batch_size`` remain, a fresh permutation
+    starts, so no sentence repeats within a batch. The draw depends only on
+    ``(seed, batch_size)``: every variant -- each in its own worker process --
+    rebuilds the identical sequence.
+
+    Raises:
+        ConfigError: If ``batch_size`` exceeds the number of sentences.
+    """
+    if batch_size > len(sentences):
+        raise ConfigError(f"batch size {batch_size} exceeds the {len(sentences)} sentences")
+    if n_batches <= 0:
+        raise ValueError("n_batches must be > 0")
+    rng = np.random.default_rng([seed, batch_size])
+    order, pos = rng.permutation(len(sentences)), 0
+    batches: list[Encoded] = []
+    while len(batches) < n_batches:
+        if pos + batch_size > len(order):
+            order, pos = rng.permutation(len(sentences)), 0
+        chosen = [sentences[int(i)] for i in order[pos : pos + batch_size]]
+        pos += batch_size
+        batches.append(encode(tokenizer, chosen, max_length=max_length, padding="longest"))
+    return Workload("dynamic", tuple(batches))
+
+
+def build_workload(
+    cfg: PipelineConfig, tokenizer: Any, batch_size: int, sentences: Sequence[str] | None
+) -> Workload:
+    """The workload ``cfg.padding`` prescribes for one batch size.
+
+    Raises:
+        ConfigError: If dynamic padding is requested without ``sentences``.
+    """
+    if cfg.padding == "max_length":
+        return Workload("max_length", (make_batch(tokenizer, batch_size, cfg.max_seq_length),))
+    if not sentences:
+        raise ConfigError("dynamic padding needs the evaluation sentences")
+    return dynamic_workload(
+        tokenizer,
+        sentences,
+        batch_size=batch_size,
+        n_batches=cfg.benchmark_iters,
+        max_length=cfg.max_seq_length,
+        seed=cfg.seed,
+    )
+
+
+# ==========================================================================
+# Per-cell measurement
+# ==========================================================================
+def measure_workload(
     runner: Runner,
-    batch: Encoded,
+    workload: Workload,
     *,
     warmup: int,
     iterations: int,
@@ -292,27 +443,26 @@ def measure_batch(
     cuda_probe: CudaMemoryProbe | None = None,
     torch_allocator: bool = False,
 ) -> BatchResult:
-    """Memory pass (untimed, sampled) followed by the timed latency loop.
+    """Shape/memory pass (untimed, sampled), warmup, then the timed latency loop.
 
     Args:
         runner: Any :class:`~opt_pipeline.runners.Runner`.
-        batch: Encoded fixed-shape batch.
-        warmup: Untimed iterations before timing.
+        workload: Batches to run; timed iteration ``i`` uses batch
+            ``i % len(workload.batches)``.
+        warmup: Untimed iterations after the shape pass.
         iterations: Timed iterations.
         ram_baseline_mb: RSS before the model was loaded.
         cuda_probe: VRAM probe for CUDA variants.
         torch_allocator: Whether the runner allocates through PyTorch (so the
             allocator peak counters are meaningful).
     """
-
-    def step() -> None:
-        runner.predict_logits(batch)
-
+    shapes = workload.shape_pass()
+    shape_iterations = max(MEMORY_PASS_ITERATIONS, len(shapes))
     if cuda_probe is not None and torch_allocator:
         cuda_probe.reset_torch_peaks()
     with RssSampler() as sampler:
-        for _ in range(MEMORY_PASS_ITERATIONS):
-            step()
+        for i in range(shape_iterations):
+            runner.predict_logits(shapes[i % len(shapes)])
             runner.synchronize()
 
     torch_alloc = torch_reserved = device_delta = None
@@ -321,21 +471,32 @@ def measure_batch(
         if torch_allocator:
             torch_alloc, torch_reserved = cuda_probe.torch_peaks_mb()
 
-    samples = time_callable(step, iterations=iterations, warmup=warmup, sync=runner.synchronize)
+    warm = cycle(workload.batches)
+    for _ in range(warmup):
+        runner.predict_logits(next(warm))
+        runner.synchronize()
+
+    timed = cycle(workload.batches)  # fresh iterator: timing always starts at batch 0
+
+    def step() -> None:
+        runner.predict_logits(next(timed))
+
+    samples = time_callable(step, iterations=iterations, sync=runner.synchronize)
     stats = LatencyStats.from_samples(samples)
-    batch_size, seq_len = (int(d) for d in batch["input_ids"].shape)
+    summary = workload.summary(iterations)
     return BatchResult(
-        batch_size=batch_size,
-        sequence_length=seq_len,
-        warmup=warmup + MEMORY_PASS_ITERATIONS,
+        batch_size=workload.batch_size,
+        sequence_length=summary["seq_len_max"],
+        warmup=warmup + shape_iterations,
         iterations=iterations,
         latency_ms=stats,
-        throughput_samples_per_s=batch_size * 1e3 / stats.mean,
+        throughput_samples_per_s=workload.batch_size * 1e3 / stats.mean,
         ram_peak_mb=sampler.peak_mb,
         ram_delta_mb=sampler.peak_mb - ram_baseline_mb,
         vram_torch_allocated_peak_mb=torch_alloc,
         vram_torch_reserved_peak_mb=torch_reserved,
         vram_device_delta_mb=device_delta,
+        workload=summary,
     )
 
 
@@ -351,6 +512,13 @@ def run_variant(
 ) -> dict[str, Any]:
     """Benchmark one variant across ``cfg.batch_sizes`` and optionally evaluate it.
 
+    Args:
+        spec: Variant to run.
+        cfg: Pipeline configuration (``cfg.padding`` selects the workload).
+        evaluate: Also compute SST-2 accuracy / F1.
+        split: Pre-loaded evaluation split (in-process mode); loaded on demand
+            otherwise.
+
     Returns a JSON-serialisable dict; ``predictions`` (dataset label space) is
     included for the parent to compute cross-variant agreement and is
     stripped before results are written.
@@ -361,6 +529,13 @@ def run_variant(
     # order, which is irrelevant to timing and may select slower algorithms.
     seed_everything(cfg.seed, deterministic=False)
     cuda_probe = CudaMemoryProbe() if spec.device == "cuda" else None
+
+    # Dynamic workloads draw from the *whole* split, independent of any
+    # evaluation cap. It is dataset memory, so it is loaded before the RAM
+    # baseline and not charged to the model.
+    workload_split: LabeledSplit | None = None
+    if cfg.padding == "dynamic":
+        workload_split = load_sst2(replace(cfg, eval_max_samples=None))
     gc.collect()
     ram_baseline = rss_mb()
 
@@ -376,12 +551,13 @@ def run_variant(
     vram_after_load = cuda_probe.delta_mb() if cuda_probe is not None else None
     log.info("[%s] loaded in %.1fs (provider=%s)", spec.name, load_seconds, provider)
 
+    sentences = workload_split.sentences if workload_split is not None else None
     results: list[dict[str, Any]] = []
     for batch_size in cfg.batch_sizes:
-        batch = make_batch(tokenizer, batch_size, cfg.max_seq_length)
-        res = measure_batch(
+        workload = build_workload(cfg, tokenizer, batch_size, sentences)
+        res = measure_workload(
             runner,
-            batch,
+            workload,
             warmup=cfg.warmup_runs,
             iterations=cfg.benchmark_iters,
             ram_baseline_mb=ram_baseline,
@@ -389,21 +565,26 @@ def run_variant(
             torch_allocator=is_torch,
         )
         log.info(
-            "[%s] bs=%-3d p50=%8.2f ms  p95=%8.2f ms  p99=%8.2f ms  %8.1f samples/s",
+            "[%s] bs=%-3d len=%5.1f  p50=%8.2f ms  p95=%8.2f ms  p99=%8.2f ms  %8.1f samples/s",
             spec.name,
             batch_size,
+            res.workload["seq_len_mean"],
             res.latency_ms.p50,
             res.latency_ms.p95,
             res.latency_ms.p99,
             res.throughput_samples_per_s,
         )
         results.append(res.to_dict())
+        del workload
 
     process_peak = process_peak_rss_mb()  # before evaluation adds dataset memory
 
     eval_block: dict[str, Any] | None = None
     predictions: list[int] | None = None
     if evaluate:
+        if split is None and workload_split is not None:
+            cap = cfg.eval_max_samples
+            split = workload_split if cap is None else workload_split.head(cap)
         split = split or load_sst2(cfg)
         eval_start = time.perf_counter()
         metrics, preds = evaluate_runner(runner, tokenizer, id2label, split, cfg)
@@ -542,7 +723,8 @@ def run_benchmarks(
         isolate: Run each variant in its own subprocess (recommended). The
             in-process mode exists for fast tests.
         evaluate: Also compute SST-2 accuracy / F1.
-        output: Destination; defaults to ``cfg.paths.benchmarks_json``.
+        output: Destination; defaults to the canonical file for
+            ``cfg.padding`` (``benchmarks.json`` / ``benchmarks_dynamic.json``).
 
     Returns:
         The validated results payload.
@@ -551,9 +733,11 @@ def run_benchmarks(
 
     specs = get_variants(variant_names)
     check_artifacts(specs, cfg)
-    output = output or cfg.paths.benchmarks_json
+    output = output or cfg.paths.benchmark_results_json(cfg.padding)
     environment = collect_environment()
-    split = load_sst2(cfg) if evaluate else None  # warm the cache once, before workers
+    # Warm the dataset cache once, before the workers (which also need it for
+    # dynamic workloads even when evaluation is off).
+    split = load_sst2(cfg) if evaluate or cfg.padding == "dynamic" else None
 
     entries: list[dict[str, Any]] = []
     started = time.perf_counter()
@@ -575,6 +759,16 @@ def run_benchmarks(
         entries.append(entry)
 
     attach_comparisons(entries, cfg)
+    padding_reference: dict[str, Any] | None = None
+    if cfg.padding == "dynamic":
+        reference = load_padding_reference(cfg)
+        if reference is not None:
+            attach_padding_comparison(entries, reference)
+            padding_reference = {
+                "path": cfg.paths.benchmarks_json.as_posix(),
+                "generated_at": reference["generated_at"],
+                "note": "fixed max_length padding, measured in a separate run",
+            }
     payload = build_payload(
         entries,
         cfg,
@@ -582,6 +776,7 @@ def run_benchmarks(
         isolate=isolate,
         evaluate=evaluate,
         duration_s=time.perf_counter() - started,
+        padding_reference=padding_reference,
     )
     atomic_write_json(output, payload)
     log.info("Wrote %s", output)
@@ -596,8 +791,9 @@ def build_payload(
     isolate: bool,
     evaluate: bool,
     duration_s: float,
+    padding_reference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Assemble and validate the top-level ``benchmarks.json`` document.
+    """Assemble and validate the top-level results document.
 
     Raises:
         PipelineError: If the assembled payload violates the schema.
@@ -612,6 +808,8 @@ def build_payload(
         "config": cfg.to_dict(),
         "variants": entries,
     }
+    if padding_reference is not None:
+        payload["padding_reference"] = padding_reference
     errors = validate_results(payload)
     if errors:
         raise PipelineError("benchmark payload failed schema validation:\n" + "\n".join(errors))
@@ -621,16 +819,39 @@ def build_payload(
 def methodology(cfg: PipelineConfig, *, isolate: bool, evaluate: bool) -> dict[str, Any]:
     """Machine-readable description of how the numbers were produced."""
     q = cfg.quantization
+    if cfg.padding == "max_length":
+        padding = f"max_length: one ({cfg.max_seq_length}-token) batch per batch size, repeated"
+        percentiles = "spread reflects system jitter only (every iteration has the same shape)"
+    else:
+        padding = (
+            f"dynamic: {cfg.benchmark_iters} distinct batches per batch size of real "
+            f"{cfg.dataset_name}/{cfg.dataset_config} {cfg.dataset_split} sentences "
+            f"(seeded draw, seed={cfg.seed}), each padded to its longest sentence "
+            f"(truncation at {cfg.max_seq_length})"
+        )
+        percentiles = (
+            "p95/p99 include real variation in padded length across batches, not only jitter"
+        )
     return {
         "timing_boundary": "host int64 numpy inputs -> host float32 logits (tokenisation excluded)",
         "cuda_sync": "torch.cuda.synchronize() after every PyTorch CUDA iteration",
-        "padding": f"max_length ({cfg.max_seq_length} tokens) for timed batches",
-        "warmup": f"{MEMORY_PASS_ITERATIONS} memory-pass + {cfg.warmup_runs} untimed iterations",
+        "padding": padding,
+        "percentiles": percentiles,
+        "workload_identity": (
+            "sha256 of every timed batch's token ids and mask; must match across variants"
+        ),
+        "warmup": (
+            f"untimed shape pass (one iteration per distinct padded length, longest first, "
+            f"min {MEMORY_PASS_ITERATIONS}) + {cfg.warmup_runs} untimed iterations"
+        ),
         "iterations": cfg.benchmark_iters,
         "gc_disabled_during_timing": True,
         "isolation": "one subprocess per variant" if isolate else "in-process (no isolation)",
         "seeding": f"seed={cfg.seed}, deterministic algorithms off for benchmarking",
-        "ram": "peak RSS sampled every 2 ms during an untimed pass; delta vs pre-load RSS",
+        "ram": (
+            "peak RSS sampled every 2 ms during the untimed shape pass; delta vs pre-load RSS "
+            "(includes the cell's pre-tokenised inputs)"
+        ),
         "vram_torch": "torch.cuda.max_memory_allocated/reserved (PyTorch variants only)",
         "vram_device": "cudaMemGetInfo used-memory delta vs post-context baseline (all CUDA)",
         "evaluation": (
@@ -684,6 +905,54 @@ def attach_comparisons(entries: list[dict[str, Any]], cfg: PipelineConfig) -> No
             res["speedup_p50_vs_device_baseline"] = (
                 ref_p50 / res["latency_ms"]["p50"] if ref_p50 else None
             )
+
+
+_REFERENCE_MUST_MATCH = ("model_id", "revision", "max_seq_length", "attn_implementation")
+
+
+def load_padding_reference(cfg: PipelineConfig) -> dict[str, Any] | None:
+    """The published fixed-padding results, if comparable with ``cfg``.
+
+    Returns ``None`` (with a warning) when the file is missing, invalid, not a
+    ``max_length`` run, or was produced for a different model / revision /
+    sequence length / attention kernel.
+    """
+    path = cfg.paths.benchmarks_json
+    if not path.exists():
+        log.warning("No %s: dynamic results will lack the vs-128-token comparison", path)
+        return None
+    try:
+        reference = load_results(path)
+    except PipelineError as exc:
+        log.warning("Ignoring padding reference %s: %s", path, exc)
+        return None
+    ref_cfg = reference["config"]
+    mismatched = [k for k in _REFERENCE_MUST_MATCH if ref_cfg.get(k) != getattr(cfg, k)]
+    if ref_cfg.get("padding", "max_length") != "max_length" or mismatched:
+        log.warning("Ignoring padding reference %s: differs in %s", path, mismatched or "padding")
+        return None
+    return reference
+
+
+def attach_padding_comparison(entries: list[dict[str, Any]], reference: dict[str, Any]) -> None:
+    """Add ``speedup_p50_vs_max_length`` per result, matched by variant and batch size.
+
+    The reference comes from a *separate* run, so this ratio carries run-to-run
+    drift; it is meaningful for the large effects padding produces, not for a
+    few percent.
+    """
+    ref_p50 = {
+        (variant["name"], res["batch_size"]): res["latency_ms"]["p50"]
+        for variant in reference["variants"]
+        if variant["status"] == "ok"
+        for res in variant["results"]
+    }
+    for entry in entries:
+        if entry["status"] != "ok":
+            continue
+        for res in entry["results"]:
+            base = ref_p50.get((entry["name"], res["batch_size"]))
+            res["speedup_p50_vs_max_length"] = base / res["latency_ms"]["p50"] if base else None
 
 
 # ==========================================================================
@@ -800,6 +1069,17 @@ _OPTIONAL_NUMBERS = (
     "vram_torch_reserved_peak_mb",
     "vram_device_delta_mb",
 )
+_WORKLOAD: dict[str, type | tuple[type, ...]] = {
+    "padding": str,
+    "distinct_batches": int,
+    "distinct_shapes": int,
+    "seq_len_mean": (int, float),
+    "seq_len_p50": (int, float),
+    "seq_len_max": int,
+    "mean_real_tokens": (int, float),
+    "real_token_fraction": (int, float),
+    "sha256": str,
+}
 
 
 def _check(obj: dict[str, Any], spec: dict[str, Any], where: str, errors: list[str]) -> None:
@@ -811,13 +1091,21 @@ def _check(obj: dict[str, Any], spec: dict[str, Any], where: str, errors: list[s
 
 
 def validate_results(payload: dict[str, Any]) -> list[str]:
-    """Return a list of schema violations (empty list = valid)."""
+    """Return a list of schema violations (empty list = valid).
+
+    Version 2 additionally requires a ``workload`` block per result and that
+    all variants were timed on the identical workload for each batch size.
+    """
     errors: list[str] = []
     _check(payload, _TOP_LEVEL, "root", errors)
     if errors:
         return errors
-    if payload["schema_version"] != SCHEMA_VERSION:
-        errors.append(f"root.schema_version: expected {SCHEMA_VERSION}")
+    version = payload["schema_version"]
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
+        errors.append(f"root.schema_version: expected one of {SUPPORTED_SCHEMA_VERSIONS}")
+        return errors
+    padding = payload["config"].get("padding", "max_length")
+    fingerprints: dict[int, set[str]] = {}
     for i, variant in enumerate(payload["variants"]):
         where = f"variants[{i}]"
         if not isinstance(variant, dict):
@@ -848,11 +1136,37 @@ def validate_results(payload: dict[str, Any]) -> list[str]:
                     errors.append(f"{rwhere}: missing key {key!r}")
                 elif res[key] is not None and not isinstance(res[key], int | float):
                     errors.append(f"{rwhere}.{key}: expected number or null")
+            if version >= 2:
+                _check_workload(res, rwhere, padding, fingerprints, errors)
         if variant.get("eval") is not None:
             for key in ("accuracy", "f1", "n"):
                 if key not in variant["eval"]:
                     errors.append(f"{where}.eval: missing key {key!r}")
+    for batch_size, hashes in sorted(fingerprints.items()):
+        if len(hashes) > 1:
+            errors.append(f"batch {batch_size}: variants were timed on different workloads")
     return errors
+
+
+def _check_workload(
+    res: dict[str, Any],
+    where: str,
+    padding: str,
+    fingerprints: dict[int, set[str]],
+    errors: list[str],
+) -> None:
+    workload = res.get("workload")
+    if not isinstance(workload, dict):
+        errors.append(f"{where}: missing key 'workload'")
+        return
+    before = len(errors)
+    _check(workload, _WORKLOAD, f"{where}.workload", errors)
+    if len(errors) > before:
+        return
+    if workload["padding"] != padding:
+        errors.append(f"{where}.workload.padding: {workload['padding']!r} != config {padding!r}")
+    if isinstance(res.get("batch_size"), int):
+        fingerprints.setdefault(res["batch_size"], set()).add(workload["sha256"])
 
 
 # ==========================================================================
@@ -862,27 +1176,51 @@ def _fmt(value: float | None, spec: str = ".2f", suffix: str = "") -> str:
     return "—" if value is None else f"{value:{spec}}{suffix}"
 
 
-def render_markdown(payload: dict[str, Any]) -> str:
-    """Render the README comparison tables from a results payload."""
+def _payload_padding(payload: dict[str, Any]) -> str:
+    padding: str = payload["config"].get("padding", "max_length")
+    return padding
+
+
+def _header(payload: dict[str, Any], source: str, workload: str) -> list[str]:
     env = payload["environment"]
     gpu = env.get("gpu") or {}
-    ok = [v for v in payload["variants"] if v["status"] == "ok"]
-    lines: list[str] = []
     power = {True: "on AC power", False: "ON BATTERY", None: "power state n/a"}[
         env.get("power_plugged")
     ]
-    lines += [
-        f"_Generated {payload['generated_at']} from `results/benchmarks.json` "
+    return [
+        f"_Generated {payload['generated_at']} from `{source}` "
         f"(schema v{payload['schema_version']}). "
         f"CPU: {env['cpu']} ({env['cpu_physical_cores']}C/{env['cpu_logical_cores']}T, "
         f"{env['ram_total_gb']} GB RAM, {power}). "
         f"GPU: {gpu.get('name', 'n/a')} ({gpu.get('total_memory_mb', '?')} MB, "
         f"driver {gpu.get('driver') or 'n/a'}). "
-        f"torch {env['torch']}, onnxruntime {env['onnxruntime']}. "
-        f"{payload['config']['benchmark_iters']} timed iterations per cell, "
-        f"sequence length {payload['config']['max_seq_length']}._",
+        f"torch {env['torch']}, onnxruntime {env['onnxruntime']}. {workload}_",
         "",
     ]
+
+
+def _not_measured(payload: dict[str, Any]) -> list[str]:
+    skipped = [v for v in payload["variants"] if v["status"] != "ok"]
+    if not skipped:
+        return []
+    return [
+        "",
+        "Not measured:",
+        *(f"- `{v['name']}` ({v['status']}): {str(v['error']).splitlines()[0]}" for v in skipped),
+    ]
+
+
+def render_markdown(payload: dict[str, Any]) -> str:
+    """Render the README tables for a results payload (either padding mode)."""
+    if _payload_padding(payload) == "dynamic":
+        return _render_dynamic(payload)
+    ok = [v for v in payload["variants"] if v["status"] == "ok"]
+    lines = _header(
+        payload,
+        "results/benchmarks.json",
+        f"{payload['config']['benchmark_iters']} timed iterations per cell, "
+        f"sequence length {payload['config']['max_seq_length']}.",
+    )
 
     for device, title in (("cpu", "CPU"), ("cuda", "GPU")):
         rows = [v for v in ok if v["device"] == device]
@@ -940,35 +1278,119 @@ def render_markdown(payload: dict[str, Any]) -> str:
             f"| {_fmt(None if drop is None else -drop * 100 + 0.0, '+.2f', ' pp')} "
             f"| {_fmt(ev.get('label_agreement_vs_reference'), '.2%')} | {verdict} |"
         )
-    skipped = [v for v in payload["variants"] if v["status"] != "ok"]
-    if skipped:
-        lines += ["", "Not measured:"]
+    lines += _not_measured(payload)
+    return "\n".join(lines) + "\n"
+
+
+def _render_dynamic(payload: dict[str, Any]) -> str:
+    """Tables for a dynamic-padding run: workload, then latency per device."""
+    cfg = payload["config"]
+    ok = [v for v in payload["variants"] if v["status"] == "ok"]
+    lines = _header(
+        payload,
+        "results/benchmarks_dynamic.json",
+        f"{cfg['benchmark_iters']} timed batches per cell, drawn (seed {cfg['seed']}) from "
+        f"the {cfg['dataset_split']} sentences; each batch is padded to its longest sentence.",
+    )
+
+    if ok:
         lines += [
-            f"- `{v['name']}` ({v['status']}): {str(v['error']).splitlines()[0]}" for v in skipped
+            "#### Workload (identical for every variant)",
+            "",
+            "| Batch | Padded length: mean / p50 / max | Real tokens per sentence "
+            f"| Real share of padded tokens | Real share at fixed {cfg['max_seq_length']} |",
+            "|---:|---:|---:|---:|---:|",
         ]
+        for r in ok[0]["results"]:
+            w = r["workload"]
+            lines.append(
+                f"| {r['batch_size']} | {w['seq_len_mean']:.1f} / {w['seq_len_p50']:.0f} / "
+                f"{w['seq_len_max']} | {w['mean_real_tokens']:.1f} "
+                f"| {w['real_token_fraction']:.1%} "
+                f"| {w['mean_real_tokens'] / cfg['max_seq_length']:.1%} |"
+            )
+        lines.append("")
+
+    for device, title in (("cpu", "CPU"), ("cuda", "GPU")):
+        rows = [v for v in ok if v["device"] == device]
+        if not rows:
+            continue
+        mem_head = "Peak RAM Δ (MB)" if device == "cpu" else "VRAM device Δ (MB)"
+        lines += [
+            f"#### {title} latency & throughput (dynamic padding)",
+            "",
+            "| Variant | Batch | p50 (ms) | p95 (ms) | p99 (ms) | Throughput (samples/s) "
+            f"| Speed-up vs PyTorch FP32 (p50) | Speed-up vs {cfg['max_seq_length']}-token "
+            f"padding (p50) | {mem_head} |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for v in rows:
+            for r in v["results"]:
+                lat = r["latency_ms"]
+                mem = r["ram_delta_mb"] if device == "cpu" else r["vram_device_delta_mb"]
+                lines.append(
+                    f"| `{v['name']}` | {r['batch_size']} | {lat['p50']:.2f} | {lat['p95']:.2f} "
+                    f"| {lat['p99']:.2f} | {r['throughput_samples_per_s']:.1f} "
+                    f"| {_fmt(r.get('speedup_p50_vs_device_baseline'), '.2f', '×')} "  # noqa: RUF001
+                    f"| {_fmt(r.get('speedup_p50_vs_max_length'), '.2f', '×')} "  # noqa: RUF001
+                    f"| {_fmt(mem, '.0f')} |"
+                )
+        lines.append("")
+
+    reference = payload.get("padding_reference")
+    if reference:
+        lines.append(
+            f"The fixed-padding p50 comes from `{reference['path']}` (generated "
+            f"{reference['generated_at']}), a separate run. The ratios therefore include "
+            "drift between runs, which has reached about 8% on this laptop's CPU, so they are "
+            "reliable for the multi-fold effects of padding but not for small differences."
+        )
+    else:
+        lines.append(f"No {cfg['max_seq_length']}-token reference run was available.")
+    # Dedupe exact values: pre-rounding would shift 0.910550... (794/872) across
+    # the .2% rounding boundary and print a different figure than the main table.
+    accuracies = sorted({v["eval"]["accuracy"] for v in ok if v.get("eval")})
+    if accuracies:
+        measured = (
+            f"{accuracies[0]:.2%} for every variant"
+            if len(accuracies) == 1
+            else f"{accuracies[0]:.2%} to {accuracies[-1]:.2%}"
+        )
+        lines.append(
+            "Accuracy does not depend on the benchmark padding mode, because evaluation always "
+            f"pads dynamically. This run re-measured {measured}."
+        )
+    lines += _not_measured(payload)
     return "\n".join(lines) + "\n"
 
 
 def write_report(payload: dict[str, Any], md_path: Path, readme: Path | None = None) -> str:
-    """Write the Markdown tables to ``md_path``; optionally splice them into ``readme``."""
+    """Write the Markdown tables to ``md_path``; optionally splice them into ``readme``.
+
+    The README section is chosen by the payload's padding mode
+    (:data:`README_MARKERS`).
+    """
     markdown = render_markdown(payload)
     atomic_write_text(md_path, markdown)
     if readme is not None:
-        update_readme(readme, markdown)
+        update_readme(readme, markdown, markers=README_MARKERS[_payload_padding(payload)])
     return markdown
 
 
-def update_readme(readme: Path, markdown: str) -> None:
-    """Replace the text between the benchmark markers in ``readme``.
+def update_readme(
+    readme: Path, markdown: str, *, markers: tuple[str, str] = (README_START, README_END)
+) -> None:
+    """Replace the text between a pair of benchmark markers in ``readme``.
 
     Raises:
         PipelineError: If the markers are missing.
     """
+    start_marker, end_marker = markers
     text = readme.read_text(encoding="utf-8")
-    start, end = text.find(README_START), text.find(README_END)
+    start, end = text.find(start_marker), text.find(end_marker)
     if start < 0 or end < start:
-        raise PipelineError(f"{readme} lacks {README_START} / {README_END} markers")
-    new = text[: start + len(README_START)] + "\n" + markdown + text[end:]
+        raise PipelineError(f"{readme} lacks {start_marker} / {end_marker} markers")
+    new = text[: start + len(start_marker)] + "\n" + markdown + text[end:]
     atomic_write_text(readme, new)
 
 

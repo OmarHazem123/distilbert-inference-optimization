@@ -68,10 +68,16 @@ def atomic_output(path: str | os.PathLike[str]) -> Iterator[Path]:
 
 
 def atomic_write_text(path: str | os.PathLike[str], text: str) -> Path:
-    """Atomically write UTF-8 text to ``path``. Returns the destination path."""
+    """Atomically write UTF-8 text with LF line endings to ``path``.
+
+    ``newline="\\n"`` disables text-mode newline translation, which would
+    otherwise write CRLF on Windows: generated results must be byte-identical
+    on every platform (and match the LF form ``.gitattributes`` stores).
+    Returns the destination path.
+    """
     dest = Path(path)
     with atomic_output(dest) as tmp:
-        tmp.write_text(text, encoding="utf-8")
+        tmp.write_text(text, encoding="utf-8", newline="\n")
     return dest
 
 

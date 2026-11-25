@@ -101,6 +101,11 @@ def benchmark(extra: list[str]) -> None:
     uv_run("opt-pipeline", "benchmark", "--update-readme", *extra)
 
 
+@task("Benchmark all variants on real SST-2 lengths (dynamic padding); update README")
+def benchmark_dynamic(extra: list[str]) -> None:
+    uv_run("opt-pipeline", "benchmark", "--padding", "dynamic", "--update-readme", *extra)
+
+
 @task("torch.profiler trace + top-10 operators (GPU if available)")
 def profile(extra: list[str]) -> None:
     uv_run("opt-pipeline", "profile", *extra)
@@ -111,14 +116,17 @@ def evaluate(extra: list[str]) -> None:
     uv_run("opt-pipeline", "evaluate", *extra)
 
 
-@task("Re-render results/benchmarks.md + README tables from benchmarks.json")
+@task("Re-render results/*.md + README tables from the results JSON files")
 def report(extra: list[str]) -> None:
     uv_run("opt-pipeline", "report", "--update-readme", *extra)
 
 
-@task("Full pipeline: doctor -> export -> quantize -> benchmark -> profile", name="all")
+@task(
+    "Full pipeline: doctor -> export -> quantize -> benchmark -> benchmark-dynamic -> profile",
+    name="all",
+)
 def run_all(extra: list[str]) -> None:
-    for step in (doctor, export, quantize, benchmark, profile):
+    for step in (doctor, export, quantize, benchmark, benchmark_dynamic, profile):
         step([])
 
 
