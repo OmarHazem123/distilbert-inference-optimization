@@ -3,17 +3,48 @@
 An end-to-end, reproducible pipeline that takes
 [`distilbert-base-uncased-finetuned-sst-2-english`](https://huggingface.co/distilbert/distilbert-base-uncased-finetuned-sst-2-english)
 from a PyTorch baseline to optimized ONNX Runtime variants (FP32, FP16, INT8). It
-measures the speed-vs-accuracy trade-off of each variant **on real hardware**.
+measures the speed-vs-accuracy trade-off of each variant **on real hardware**. Every
+number below comes from `results/benchmarks.json`, produced by this code on the machine
+described.
 
 | | |
 |---|---|
-| **Model** | DistilBERT (66M params), binary sentiment (SST-2) |
-| **Backends** | PyTorch (CPU/CUDA, FP32/FP16) and ONNX Runtime (CPU EP, CUDA EP) |
-| **Optimizations** | ONNX export (opset 17), dynamic INT8 quantization, FP16 graph conversion |
-| **Metrics** | p50/p95/p99 latency, throughput, peak RAM/VRAM, model size, SST-2 accuracy & F1 |
+| **Model** | DistilBERT (66M params), binary sentiment (SST-2), weights pinned to commit `714eb0f` |
+| **Backends** | PyTorch (CPU/CUDA, FP32/FP16) and ONNX Runtime 1.26 (CPU EP, CUDA EP) |
+| **Optimizations** | ONNX export (opset 17, dynamic axes), dynamic INT8 quantization, FP16 graph conversion |
+| **Metrics** | p50/p95/p99 latency, throughput, peak RAM/VRAM, model size, SST-2 accuracy, F1, label agreement |
 
-> **Status:** Phase 1 is complete (scaffold, config, PyTorch baseline, ONNX export + parity).
-> Phase 2 adds quantization, benchmarking, profiling and the test suite.
+## Key findings
+
+All numbers are p50 latency on fixed 128-token batches, measured on the hardware below.
+Every variant was measured; none were skipped.
+
+- **CPU: ONNX Runtime INT8 is the clear winner.**
+  - **1.86× faster** than PyTorch FP32 at batch 1 (71.9 → 38.7 ms), 1.64× at batch 8 and
+    1.37× at batch 32.
+  - **3.96× smaller**: 255.6 → 64.5 MB.
+  - About 1/3 of the extra RAM: 103 vs 304 MB at batch 1.
+  - **No measured accuracy loss**: 91.06% SST-2 accuracy, F1 0.9135 vs 0.9137, and 98.4%
+    of predictions identical to FP32.
+- **CPU: ORT FP32 alone is a modest win.** It is 1.25× faster at batch 1, but PyTorch is
+  slightly faster at batch 32 (0.93×). The two variants ran minutes apart on a laptop CPU,
+  so treat an 8% gap as near parity rather than a ranking. PyTorch CPU also has the widest
+  tail: at batch 8, p95 is 773 ms against a p50 of 540 ms.
+- **GPU: ORT CUDA FP32 is the fastest variant overall.** It runs 1.30× faster than PyTorch
+  CUDA FP32 at batch 1 (9.1 → 7.0 ms) and 1.13× faster at batch 32, reaching 186
+  samples/s at batch 8. At batch 1 it is 10× faster than the PyTorch CPU baseline.
+- **GPU: FP16 is 3.8–5.1× *slower* than FP32 on this GTX 1650 Ti**, for both PyTorch and
+  ORT, and throughput caps at ~37 samples/s.
+  - The profile shows why: cuBLAS runs FP16 GEMMs on Tensor-Core (`s884gemm`) kernels, and
+    this GPU has no Tensor Cores. Those GEMMs take 4.7× as long as FP32's SGEMM kernels.
+  - FP16 still halves VRAM (torch allocated 165 vs 294 MB) and the ORT model file
+    (127.9 MB), with 100% label agreement. PyTorch FP16 casts the FP32 checkpoint at load,
+    so its on-disk size stays 255.4 MB. Use FP16 here only when VRAM, not latency, is the
+    constraint.
+- **Accuracy holds everywhere.** All 7 variants score 91.06% on SST-2 validation, and every
+  INT8/FP16 variant is within the configured tolerances.
+- **Recommendation for this machine:** ORT CUDA FP32 for GPU serving, and ORT INT8
+  (per-channel + `reduce_range`) for CPU serving.
 
 ---
 
@@ -21,14 +52,10 @@ measures the speed-vs-accuracy trade-off of each variant **on real hardware**.
 
 | Component | Spec |
 |---|---|
-| GPU | NVIDIA GeForce GTX 1650 Ti, 4 GB VRAM, Turing `sm_75`, **no Tensor Cores** |
-| OS | Windows 11 + Git Bash |
-| Stack | Python 3.12, torch 2.14.1+cu126, onnxruntime-gpu 1.26.0 (CUDA 12 / cuDNN 9) |
-
-GTX 16-series cards lack Tensor Cores, so FP16 GEMMs get none of the speed-up
-that Tensor Cores give on RTX cards. Expect FP16 to be at best modestly faster
-than FP32 on this GPU, and possibly slower. The benchmark measures this rather
-than assuming it.
+| CPU | Intel Core i5-10300H (Comet Lake, 4 cores / 8 threads, AVX2, **no VNNI**), 20 GB RAM |
+| GPU | NVIDIA GeForce GTX 1650 Ti, 4 GB VRAM, Turing `sm_75`, **no Tensor Cores**, driver 591.59 |
+| OS | Windows 11 + Git Bash, laptop on AC power |
+| Stack | Python 3.12, torch 2.14.1+cu126, onnxruntime-gpu 1.26.0 (CUDA 12 / cuDNN 9), transformers 5.24 |
 
 ---
 
@@ -38,37 +65,244 @@ Requires [uv](https://docs.astral.sh/uv/) and an NVIDIA driver supporting CUDA 1
 `make` is **not** required. Every task runs through `tasks.py` (stdlib only).
 
 ```bash
-python tasks.py setup     # uv sync -> .venv with CUDA torch + onnxruntime-gpu
-python tasks.py doctor    # verify torch CUDA build + a real ORT CUDA session
-python tasks.py predict   # sanity-check the PyTorch baseline
-python tasks.py export    # export ONNX (opset 17) + parity check on CPU and CUDA EPs
+python tasks.py setup      # uv sync -> .venv with CUDA torch + onnxruntime-gpu
+python tasks.py doctor     # verify torch CUDA build + a real ORT CUDA session
+python tasks.py export     # FP32 ONNX (opset 17) + parity check on CPU and CUDA EPs
+python tasks.py quantize   # INT8 (dynamic) + FP16 graphs, verified on all of SST-2 validation
+python tasks.py benchmark  # all 7 variants, isolated workers; rewrites the tables below
+python tasks.py profile    # torch.profiler Chrome trace + top-10 operators
+python tasks.py all        # doctor -> export -> quantize -> benchmark -> profile
 ```
 
-Extra CLI flags go after `--`, e.g. `python tasks.py export -- --parity-device cpu`.
-If you do have `make`, `make export` and similar targets call the same tasks.
+Extra CLI flags go after `--`, e.g. `python tasks.py benchmark -- --variants ort-cpu-int8`.
+A subset or quick run (`--variants`, `--iters`, `--batch-sizes`, `--skip-eval`, ...) writes
+`results/benchmarks.partial.json` and leaves the published results and README untouched.
+Only a complete default run updates them.
+If you do have `make`, `make benchmark` and similar targets call the same tasks.
 
-The CLI is also available directly:
+### CLI
 
-```bash
-uv run opt-pipeline --help
-uv run opt-pipeline predict "What a wonderful film" --device cuda --precision fp16
-```
+| Command | What it does |
+|---|---|
+| `opt-pipeline env` | Checks the torch CUDA build and GPU arch, then opens a **real** ORT CUDA session |
+| `opt-pipeline predict [TEXT...]` | Classifies sentences with the PyTorch baseline (`--device`, `--precision`) |
+| `opt-pipeline export` | Exports ONNX (`--exporter torchscript\|dynamo`, `--opset`), then checks parity on CPU and CUDA |
+| `opt-pipeline quantize` | Builds the INT8 and FP16 graphs and checks agreement with FP32 on SST-2 (`--skip-int8`, `--skip-fp16`) |
+| `opt-pipeline benchmark` | Measures latency, throughput, memory, size and accuracy (`--variants`, `--batch-sizes`, `--iters`, `--no-isolate`, `--update-readme`) |
+| `opt-pipeline profile` | Runs `torch.profiler` and prints the top operators by self time (`--device`, `--precision`, `--batch-size`) |
+| `opt-pipeline evaluate` | Reports SST-2 accuracy, F1 and label agreement per variant (in-process) |
+| `opt-pipeline report` | Re-renders `results/benchmarks.md` and the README tables from the JSON |
 
-### Why the CUDA wheels are pinned
+Variants: `pytorch-cpu-fp32`, `ort-cpu-fp32`, `ort-cpu-int8`, `pytorch-cuda-fp32`,
+`pytorch-cuda-fp16`, `ort-cuda-fp32`, `ort-cuda-fp16`.
 
-On Windows, PyPI's `torch` is a **CPU-only** build, and any `pip install`/`uv add`
-that re-resolves torch can silently replace the CUDA build. `pyproject.toml`
-prevents this:
+---
+
+## Results
+
+### Benchmarks
+
+<!-- BENCHMARKS:START -->
+_Generated 2026-11-25T08:09:32+00:00 from `results/benchmarks.json` (schema v1). CPU: Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz (4C/8T, 19.8 GB RAM, on AC power). GPU: NVIDIA GeForce GTX 1650 Ti (4096 MB, driver 591.59). torch 2.14.1+cu126, onnxruntime 1.26.0. 100 timed iterations per cell, sequence length 128._
+
+#### CPU latency & throughput
+
+| Variant | Batch | p50 (ms) | p95 (ms) | p99 (ms) | Throughput (samples/s) | Speed-up vs PyTorch FP32 (p50) | Peak RAM Δ (MB) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `pytorch-cpu-fp32` | 1 | 71.87 | 78.09 | 128.99 | 13.6 | 1.00× | 304 |
+| `pytorch-cpu-fp32` | 8 | 540.36 | 772.51 | 821.42 | 14.0 | 1.00× | 353 |
+| `pytorch-cpu-fp32` | 32 | 1910.81 | 2065.92 | 2147.36 | 16.7 | 1.00× | 500 |
+| `ort-cpu-fp32` | 1 | 57.40 | 63.11 | 63.73 | 17.6 | 1.25× | 292 |
+| `ort-cpu-fp32` | 8 | 486.89 | 515.77 | 533.69 | 16.4 | 1.11× | 334 |
+| `ort-cpu-fp32` | 32 | 2065.43 | 2131.90 | 2203.03 | 15.5 | 0.93× | 489 |
+| `ort-cpu-int8` | 1 | 38.68 | 40.76 | 42.54 | 26.1 | 1.86× | 103 |
+| `ort-cpu-int8` | 8 | 329.19 | 344.24 | 352.45 | 24.3 | 1.64× | 141 |
+| `ort-cpu-int8` | 32 | 1396.51 | 1475.96 | 1520.36 | 22.9 | 1.37× | 261 |
+
+#### GPU latency & throughput
+
+| Variant | Batch | p50 (ms) | p95 (ms) | p99 (ms) | Throughput (samples/s) | Speed-up vs PyTorch FP32 (p50) | VRAM device Δ (MB) | VRAM torch alloc / reserved (MB) |
+|---|---:|---:|---:|---:|---:|---:|---: | ---:|
+| `pytorch-cuda-fp32` | 1 | 9.11 | 10.35 | 10.89 | 107.3 | 1.00× | 368 | 294 / 326 |
+| `pytorch-cuda-fp32` | 8 | 51.19 | 51.76 | 52.16 | 156.4 | 1.00× | 412 | 322 / 370 |
+| `pytorch-cuda-fp32` | 32 | 224.53 | 225.46 | 226.05 | 142.6 | 1.00× | 532 | 421 / 490 |
+| `pytorch-cuda-fp16` | 1 | 34.82 | 35.44 | 35.73 | 28.6 | 0.26× | 224 | 165 / 182 |
+| `pytorch-cuda-fp16` | 8 | 217.38 | 217.89 | 218.26 | 36.8 | 0.24× | 244 | 181 / 202 |
+| `pytorch-cuda-fp16` | 32 | 862.55 | 863.04 | 863.22 | 37.1 | 0.26× | 312 | 230 / 270 |
+| `ort-cuda-fp32` | 1 | 7.02 | 7.82 | 7.98 | 140.0 | 1.30× | 590 | — |
+| `ort-cuda-fp32` | 8 | 43.04 | 43.51 | 44.49 | 185.8 | 1.19× | 590 | — |
+| `ort-cuda-fp32` | 32 | 198.19 | 199.39 | 199.56 | 161.5 | 1.13× | 590 | — |
+| `ort-cuda-fp16` | 1 | 28.98 | 29.26 | 29.72 | 34.5 | 0.31× | 230 | — |
+| `ort-cuda-fp16` | 8 | 220.11 | 220.40 | 221.04 | 36.3 | 0.23× | 358 | — |
+| `ort-cuda-fp16` | 32 | 877.16 | 877.34 | 877.40 | 36.5 | 0.26× | 358 | — |
+
+#### Accuracy & size (SST-2 validation)
+
+| Variant | Provider | Model size (MB) | Accuracy | F1 | Δ accuracy vs PyTorch FP32 | Label agreement | Within tolerance |
+|---|---|---:|---:|---:|---:|---:|:---:|
+| `pytorch-cpu-fp32` | torch-cpu | 255.4 | 91.06% | 0.9137 | +0.00 pp | 100.00% | — |
+| `ort-cpu-fp32` | CPUExecutionProvider | 255.6 | 91.06% | 0.9137 | +0.00 pp | 100.00% | — |
+| `ort-cpu-int8` | CPUExecutionProvider | 64.5 | 91.06% | 0.9135 | +0.00 pp | 98.39% | ✅ |
+| `pytorch-cuda-fp32` | torch-cuda | 255.4 | 91.06% | 0.9137 | +0.00 pp | 100.00% | — |
+| `pytorch-cuda-fp16` | torch-cuda | 255.4 | 91.06% | 0.9137 | +0.00 pp | 100.00% | ✅ |
+| `ort-cuda-fp32` | CUDAExecutionProvider | 255.6 | 91.06% | 0.9137 | +0.00 pp | 100.00% | — |
+| `ort-cuda-fp16` | CUDAExecutionProvider | 127.9 | 91.06% | 0.9137 | +0.00 pp | 100.00% | ✅ |
+<!-- BENCHMARKS:END -->
+
+### Methodology
+
+Each number in the tables is measured as follows. The same description is stored in
+`benchmarks.json` under `methodology`.
+
+- **Isolation.** Each variant runs in a fresh subprocess. Peak RAM, the CUDA context,
+  allocator caches and thread pools never carry over between variants. A failing variant is
+  recorded as `error` with its log tail; it doesn't abort the run.
+- **Timing boundary.** Host `int64` NumPy arrays go in and host `float32` logits come out,
+  identically for every backend. PyTorch pays its host-to-device copy and device-to-host
+  readback exactly as ONNX Runtime does. Tokenisation is excluded because it's identical
+  for all variants. PyTorch CUDA iterations end with `torch.cuda.synchronize()`.
+- **Shapes.** Timed batches are padded to a fixed `max_length = 128` tokens, so every
+  variant does exactly the same work. This is the worst case for SST-2, whose sentences
+  average about 25 tokens.
+- **Warmup.** 3 untimed memory-measurement iterations, then 10 untimed warmup iterations,
+  then 100 timed iterations with Python's garbage collector disabled. Seeds are fixed, and
+  deterministic-algorithm mode is off for benchmarking.
+- **RAM.** Peak RSS, sampled every 2 ms during the *untimed* pass, minus RSS before the
+  model was loaded. The sampler thread never runs alongside the timed loop.
+- **VRAM.** Two measurements, because they see different things:
+  - *Device Δ*: `cudaMemGetInfo` used memory minus a baseline taken after the worker's CUDA
+    context exists. It sees every runtime's allocations, so it is comparable across backends.
+    It counts memory *reserved* by allocator pools. ONNX Runtime's CUDA arena grows in
+    powers of two, which inflates its number relative to bytes actually used.
+  - *torch alloc / reserved*: `torch.cuda.max_memory_allocated()` and
+    `max_memory_reserved()`. These only exist for PyTorch variants, because ORT allocations
+    are invisible to PyTorch's allocator, and they show `—` (never 0) for ORT.
+- **Accuracy.** Measured on the full SST-2 validation split (872 sentences) with dynamic
+  padding. *Label agreement* is the fraction of predictions identical to PyTorch FP32 on
+  CPU. *Within tolerance* checks agreement and accuracy drop against `Tolerances` in
+  `config.py`: INT8 needs ≥ 95% agreement and ≤ 2 pp drop; FP16 needs ≥ 99% and ≤ 0.5 pp.
+- **Model size.** The on-disk size of the file each variant loads. PyTorch FP16 casts the
+  FP32 checkpoint at load time, so its size equals FP32's.
+- **Scope.** Dynamic INT8 is a CPU optimization in ONNX Runtime, so it is benchmarked on
+  CPU only. The FP16 graph targets the CUDA EP; the CPU EP is an FP32 engine.
+
+### ONNX export parity (PyTorch FP32 vs ONNX Runtime FP32)
+
+Measured with `python tasks.py export`. The reference is PyTorch FP32 on CPU. Each EP runs
+10 input shapes: batch sizes 1, 4 and 8, sequence lengths 3 to 128, covering padded,
+unpadded and truncated inputs.
+
+| ONNX Runtime EP | Opset | Shapes | Max abs logit diff | `np.allclose` (atol 1e-4, rtol 1e-3) | Label agreement |
+|---|---|---|---|---|---|
+| `CPUExecutionProvider` | 17 | 10 | 9.98e-06 | ✅ all | 100% |
+| `CUDAExecutionProvider` | 17 | 10 | 4.35e-06 | ✅ all | 100% |
+
+**Exporter.** `exporter = "torchscript"` (`dynamo=False`) is the default. It emits opset 17
+and honours `dynamic_axes` natively. torch 2.14 marks it deprecated; `uv.lock` pins torch, so
+it stays reproducible. `--exporter dynamo` uses the `torch.export`-based exporter instead:
+it builds at opset 18 and down-converts to 17. Verified result: opset 17, parity max diff
+1.5e-05 on CPU and 4.5e-06 on CUDA. Its progress output contains emoji, which crash Python's
+cp1252 stdout on Windows. The pipeline therefore switches stdio to UTF-8 in-process (an
+in-process `PYTHONUTF8=1`) and also sets `PYTHONUTF8=1` for every child process.
+`export_onnx` raises if the written opset doesn't match the requested one.
+
+### INT8 settings sweep
+
+The INT8 defaults in `QuantizationConfig` come from a measured sweep, not from the
+textbook recipe. Reproduce it with `uv run python scripts/int8_sweep.py`, which writes
+`results/int8_sweep.json`. All rows are ORT dynamic quantization with QInt8 weights, scored
+on all 872 SST-2 validation sentences. PyTorch FP32 scores 91.06% accuracy and 0.9137 F1.
+Latency is a rough batch-8 p50 (20 iterations), a quick indicator rather than the benchmark
+methodology.
+
+| Quantized ops | Weight scales | `reduce_range` | Size (MB) | Accuracy | Drop | Agreement with FP32 | bs8 p50 (ms) |
+|---|---|---|---:|---:|---:|---:|---:|
+| MatMul | per-channel | off | 132.7 | **48.97%** | 42.1 pp | 47.1% | 391 |
+| MatMul + Gather | per-channel | off | 64.5 | **49.31%** | 41.7 pp | 47.5% | 392 |
+| MatMul | per-tensor | off | 132.5 | 89.79% | 1.26 pp | 97.8% | 385 |
+| MatMul + Gather | per-tensor | off | 64.3 | 90.14% | 0.92 pp | 97.5% | 384 |
+| MatMul | per-channel | on | 132.7 | 90.25% | 0.80 pp | 98.7% | 385 |
+| **MatMul + Gather** | **per-channel** | **on** | **64.5** | **91.06%** | **0.00 pp** | **98.4%** | 392 |
+
+(ORT FP32 measured the same way: 539 ms.)
+
+With per-channel weights at full 8-bit range, the model **collapses** to predicting one
+class. This CPU has AVX2 but no VNNI. ORT's u8×s8 integer GEMM there accumulates pairwise
+products in int16 (`vpmaddubsw`), which saturates when weights use the full s8 range.
+Per-channel scaling pushes every channel to that range. `reduce_range=True` (7-bit weights)
+removes the overflow. Quantizing `Gather` (the embedding table) halves the file again at no
+measured cost. The zero accuracy drop is partly luck, since flips in both directions
+cancel; the 98.4% label agreement is the more robust number.
+
+`quant_pre_process` runs with `skip_symbolic_shape=True`. ORT's symbolic shape inference
+cannot resolve the attention-mask subgraph that transformers 5 emits.
+
+### Bottleneck profile
+
+`python tasks.py profile` records 5 steady-state steps of the PyTorch baseline with
+`torch.profiler` (batch 8 × 128 tokens, after warmup). It writes a Chrome trace (open it in
+<https://ui.perfetto.dev>) and ranks **operators** and **CUDA kernels** separately by self
+time. Rankings exclude the `ProfilerStep*` wrapper, so no time is counted twice. The output
+lands in `artifacts/profiles/`.
+
+**Top operators, as a share of each run's total (GPU kernel time on CUDA, self CPU time on CPU):**
+
+| Operator | CUDA FP32 | CUDA FP16 | CPU FP32 |
+|---|---:|---:|---:|
+| `aten::addmm` (all linear layers: Q/K/V/O, FFN, classifier) | 223.6 ms (91.3%) | 1043.5 ms (97.7%) | 2247.4 ms (81.0%) |
+| attention (`_efficient_attention_forward` / CPU flash SDPA) | 9.8 ms (4.0%) | 17.8 ms (1.7%) | 120.7 ms (4.3%) |
+| `aten::gelu` | 4.4 ms (1.8%) | 2.2 ms (0.2%) | 119.2 ms (4.3%) |
+| `aten::add` (residuals) | 3.5 ms (1.4%) | 1.9 ms (0.2%) | 62.6 ms (2.3%) |
+| `aten::native_layer_norm` | 3.0 ms (1.2%) | 1.9 ms (0.2%) | 49.0 ms (1.8%) |
+| `aten::copy_` | < 0.1 ms | < 0.1 ms | 135.6 ms (4.9%) |
+| **Total** | **245.1 ms** | **1067.8 ms** | **2775.4 ms** |
+
+**Top CUDA kernels:**
+
+| Run | Kernels behind `aten::addmm` | GEMM time |
+|---|---|---:|
+| FP32 | `volta_sgemm_32x128_tn` (86.7 ms), `volta_sgemm_128x32_tn` (84.5), `volta_sgemm_128x128_tn` (52.3) | 223.5 ms |
+| FP16 | `volta_fp16_s884gemm_fp16_128x128_ldg8_relu_f2f_tn` (348.6 ms), its `stages_32x1` variant (347.7), `cutlass_70_tensorop_f16_s884gemm` (346.9) | 1043.1 ms |
+
+What the profile shows:
+
+1. **The model is GEMM-bound on every device.** Linear layers take 81–98% of the time.
+   Attention is at most 4%, so attention-specific optimizations such as fused attention or
+   FlashAttention variants would gain little here. INT8 helps on CPU precisely because it
+   attacks the GEMMs.
+2. **Why FP16 is slower on this GPU.** For FP16, cuBLAS picks `s884` *tensor-op* (HMMA)
+   GEMM kernels. Those are designed for Tensor Cores, and TU117 has none. On this card they
+   take 4.7× as long as FP32's plain SGEMM kernels. Memory-bound element-wise ops benefit
+   from FP16 as expected: GELU drops from 4.4 to 2.2 ms and LayerNorm from 3.0 to 1.9 ms.
+   They are too small to matter. ORT's CUDA EP shows the same end-to-end slowdown, which
+   fits it relying on the same cuBLAS FP16 GEMMs.
+3. **On CPU, GEMMs dominate as well.** Most of the remaining time goes to `copy_`
+   (layout/contiguity copies around attention), GELU and SDPA. ORT's graph fusions, which
+   remove such glue ops, are a plausible source of its batch-1 advantage. INT8 GEMMs cut
+   the dominant term.
+
+Possible follow-ups, not yet measured:
+- Force non-tensor-op FP16 GEMMs and check whether TU117's native 2:1 FP16 rate appears.
+- Use ORT's fused transformer optimizer (`onnxruntime.transformers.optimizer`) as a
+  separately labelled variant.
+- Benchmark dynamic padding, i.e. realistic sequence lengths around 25 tokens rather than 128.
+
+---
+
+## Why the CUDA wheels are pinned
+
+On Windows, PyPI's `torch` is a **CPU-only** build, and any `pip install`/`uv add` that
+re-resolves torch can silently replace the CUDA build. `pyproject.toml` prevents this:
 
 - `torch` is bound to the `https://download.pytorch.org/whl/cu126` index via
   `[tool.uv.sources]`, with `explicit = true` so no other package resolves from it.
 - `onnxruntime-gpu` is capped at `<1.27`. **1.26.0 is the last PyPI release built for
-  CUDA 12**; 1.27+ targets CUDA 13. It shares the CUDA 12 / cuDNN 9 DLLs bundled in
-  the torch wheel, so no system-wide CUDA Toolkit or cuDNN install is needed.
-- The CPU-only `onnxruntime` package is deliberately **not** a dependency. It
-  installs the same `onnxruntime/` module and would shadow the GPU build.
-- `create_ort_session` raises if the CUDA EP fails to load, instead of letting ORT
-  silently fall back to CPU and mislabel CPU numbers as "GPU".
+  CUDA 12**; 1.27+ targets CUDA 13. It uses the CUDA 12 / cuDNN 9 DLLs bundled in the torch
+  wheel, so no system-wide CUDA Toolkit or cuDNN install is needed.
+- The CPU-only `onnxruntime` package is deliberately **not** a dependency. It installs the
+  same `onnxruntime/` module and would shadow the GPU build.
+- `create_ort_session` raises if the CUDA EP fails to load, instead of letting ORT silently
+  fall back to CPU and mislabel CPU numbers as "GPU".
 
 ---
 
@@ -76,48 +310,47 @@ prevents this:
 
 ```
 src/opt_pipeline/
-  config.py          Frozen dataclass config: model (+ pinned revision), seq len, batch sizes,
-                     warmup/iterations, tolerances, paths
-  errors.py          PipelineError hierarchy (CLI prints these cleanly; bugs keep tracebacks)
-  utils.py           Logging, atomic file writes (tmp + os.replace), file sizes
-  baseline.py        PyTorch runner: deterministic seeding, CPU/CUDA, FP32/FP16, shared tokenisation
-  export_onnx.py     ONNX export (opset 17, dynamic batch/sequence axes) + PyTorch parity check
-  cli.py             `opt-pipeline` CLI (env, predict, export)
-tasks.py             Cross-platform task runner (make replacement)
-Makefile             Thin wrapper around tasks.py
+  config.py              Frozen dataclass config (model + pinned revision, seq len, batch sizes,
+                         warmup/iterations, exporter, tolerances, quantization, paths);
+                         to_dict/from_dict round-trip for isolated workers
+  errors.py              PipelineError hierarchy (CLI prints these cleanly; bugs keep tracebacks)
+  utils.py               Logging, atomic writes (tmp + os.replace), UTF-8 stdio, file sizes
+  baseline.py            PyTorch runner: deterministic seeding, CPU/CUDA, FP32/FP16, tokenisation
+  export_onnx.py         ONNX export (torchscript | dynamo, opset 17, dynamic axes), ORT session
+                         factory (no silent CPU fallback), PyTorch parity verification
+  quantize.py            INT8 dynamic quantization, FP16 conversion, agreement vs FP32 reference
+  runners.py             Variant registry + uniform host-to-host Runner over PyTorch / ORT
+  evaluate.py            SST-2 loading, accuracy / F1 / label agreement
+  benchmark.py           Latency / throughput / memory measurement, isolated workers,
+                         results schema, Markdown report
+  profile_bottlenecks.py torch.profiler trace + top-N operators
+  cli.py                 `opt-pipeline` CLI
+tests/
+  test_parity.py         Shapes, FP32 equivalence, dynamic seq len, INT8/FP16 tolerance,
+                         CUDA EP, dynamo exporter
+  test_benchmark.py      Latency/memory collection, JSON schema, comparisons, report, config
+scripts/int8_sweep.py    Reproduces the INT8 settings sweep -> results/int8_sweep.json
+tasks.py                 Cross-platform task runner (make replacement)
+Makefile                 Thin wrapper around tasks.py
 ```
 
-Generated, git-ignored: `.venv/`, `models/` (HF model cache), `data/` (datasets),
-`artifacts/` (ONNX graphs, profiler traces). `results/benchmarks.json` is tracked.
+Generated and git-ignored: `.venv/`, `models/` (HF model cache), `data/` (processed SST-2
+Arrow cache), and `artifacts/` (ONNX graphs, profiler traces, worker logs). The raw SST-2
+parquet files (~3 MB) always go to the shared `~/.cache/huggingface/hub`; datasets 5.x
+ignores `DownloadConfig.cache_dir` for Hub files. `results/` is tracked: `benchmarks.json`
+(+ `.md`), `evaluation.json` and `int8_sweep.json`.
 
----
+## Testing
 
-## Results
+```bash
+python tasks.py test-fast   # 31 fast tests: metrics, schema, report, config, CLI (~3 s, no model)
+python tasks.py test        # all 60: + export, INT8/FP16 parity, GPU, worker, profiler (~2 min)
+python tasks.py check       # ruff + mypy --strict + full pytest
+```
 
-### ONNX export parity (PyTorch FP32 vs ONNX Runtime FP32)
-
-Measured on the reference hardware with `python tasks.py export`. The reference is PyTorch
-FP32 on CPU. Each EP runs 10 input shapes: batch sizes 1, 4 and 8, sequence lengths 3 to 128,
-covering padded, unpadded and truncated inputs.
-
-| ONNX Runtime EP | Opset | Shapes | Max abs logit diff | `np.allclose` (atol 1e-4, rtol 1e-3) | Label agreement |
-|---|---|---|---|---|---|
-| `CPUExecutionProvider` | 17 | 10 | 9.98e-06 | ✅ all | 100% |
-| `CUDAExecutionProvider` | 17 | 10 | 4.35e-06 | ✅ all | 100% |
-
-The exported FP32 graph is 255.6 MB. The full per-shape report is written to
-`artifacts/onnx/model_fp32.parity.json`.
-
-**Exporter note:** the export uses the TorchScript exporter (`dynamo=False`). It honours
-`opset_version=17` and `dynamic_axes` natively. torch 2.14 marks it deprecated, and `uv.lock`
-pins torch, so this is reproducible today. The dynamo exporter was also tested: it exports at
-opset 18, auto-converts down to 17, and passes the same parity check (max diff 1.5e-05). On
-Windows it needs `PYTHONUTF8=1`, because its progress output contains emoji that the cp1252
-console cannot encode.
-
-### Benchmarks
-
-_Phase 2. The table will be generated from measured `results/benchmarks.json`._
+Slow tests are marked `slow`, and GPU tests are marked `gpu` and skip without CUDA. Tests
+write only to pytest temp directories; they share the `models/` and `data/` caches but never
+touch `artifacts/` or `results/`.
 
 ---
 

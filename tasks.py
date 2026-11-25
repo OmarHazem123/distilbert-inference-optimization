@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -25,11 +26,11 @@ TaskFn = Callable[[list[str]], None]
 TASKS: dict[str, tuple[TaskFn, str]] = {}
 
 
-def task(description: str) -> Callable[[TaskFn], TaskFn]:
-    """Register a function as a task. Underscores in the name become dashes."""
+def task(description: str, *, name: str | None = None) -> Callable[[TaskFn], TaskFn]:
+    """Register a function as a task (default name: function name, ``_`` -> ``-``)."""
 
     def decorator(fn: TaskFn) -> TaskFn:
-        TASKS[fn.__name__.replace("_", "-")] = (fn, description)
+        TASKS[name or fn.__name__.replace("_", "-")] = (fn, description)
         return fn
 
     return decorator
@@ -42,10 +43,19 @@ def _uv() -> str:
     return exe
 
 
+def _child_env() -> dict[str, str]:
+    env = dict(os.environ)
+    # UTF-8 stdio for children: the dynamo ONNX exporter and HF progress bars
+    # print characters the Windows ANSI code page (cp1252) cannot encode.
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    return env
+
+
 def run(*cmd: str) -> None:
     """Echo and run a command from the repo root; abort on non-zero exit."""
     print(f"\n$ {' '.join(cmd)}", flush=True)
-    code = subprocess.call(list(cmd), cwd=ROOT)
+    code = subprocess.call(list(cmd), cwd=ROOT, env=_child_env())
     if code != 0:
         sys.exit(code)
 
@@ -81,10 +91,41 @@ def export(extra: list[str]) -> None:
     uv_run("opt-pipeline", "export", *extra)
 
 
+@task("Build INT8 (dynamic) + FP16 ONNX graphs and verify them on SST-2")
+def quantize(extra: list[str]) -> None:
+    uv_run("opt-pipeline", "quantize", *extra)
+
+
+@task("Benchmark all variants (isolated workers) and update the README tables")
+def benchmark(extra: list[str]) -> None:
+    uv_run("opt-pipeline", "benchmark", "--update-readme", *extra)
+
+
+@task("torch.profiler trace + top-10 operators (GPU if available)")
+def profile(extra: list[str]) -> None:
+    uv_run("opt-pipeline", "profile", *extra)
+
+
+@task("SST-2 validation accuracy / F1 / agreement for every variant")
+def evaluate(extra: list[str]) -> None:
+    uv_run("opt-pipeline", "evaluate", *extra)
+
+
+@task("Re-render results/benchmarks.md + README tables from benchmarks.json")
+def report(extra: list[str]) -> None:
+    uv_run("opt-pipeline", "report", "--update-readme", *extra)
+
+
+@task("Full pipeline: doctor -> export -> quantize -> benchmark -> profile", name="all")
+def run_all(extra: list[str]) -> None:
+    for step in (doctor, export, quantize, benchmark, profile):
+        step([])
+
+
 # --------------------------------------------------------------------------
 # Quality
 # --------------------------------------------------------------------------
-_LINT_PATHS = ("src", "tests", "tasks.py")
+_LINT_PATHS = ("src", "tests", "scripts", "tasks.py")
 
 
 @task("Lint and check formatting with ruff")
@@ -104,9 +145,14 @@ def typecheck(extra: list[str]) -> None:
     uv_run("mypy", *extra)
 
 
-@task("Run the pytest suite")
+@task("Run the full pytest suite (incl. slow model + GPU tests)")
 def test(extra: list[str]) -> None:
     uv_run("pytest", *extra)
+
+
+@task("Run only the fast tests (no model download / export)")
+def test_fast(extra: list[str]) -> None:
+    uv_run("pytest", "-m", "not slow", *extra)
 
 
 @task("Run lint + typecheck + test")

@@ -15,12 +15,14 @@ Example:
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field, replace
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from opt_pipeline.errors import ConfigError
+
+_T = TypeVar("_T")
 
 __all__ = [
     "DEFAULT_MODEL_ID",
@@ -28,11 +30,21 @@ __all__ = [
     "AttnImplementation",
     "ConfigError",
     "DeviceName",
+    "ExporterName",
     "PathsConfig",
     "PipelineConfig",
     "Precision",
+    "QuantizationConfig",
     "Tolerances",
 ]
+
+ExporterName = Literal["torchscript", "dynamo"]
+"""ONNX exporter backend.
+
+``torchscript`` (default) is the legacy ``torch.onnx.export(dynamo=False)``
+path: it emits opset 17 natively and honours ``dynamic_axes``. ``dynamo`` is
+the ``torch.export``-based exporter; it builds at opset 18 and down-converts to
+the requested opset (verified to reach 17 for this model)."""
 
 DeviceName = Literal["auto", "cpu", "cuda"]
 """Execution target: ``auto`` picks CUDA when available, otherwise CPU."""
@@ -138,9 +150,58 @@ class PathsConfig:
         return self.artifacts_dir / "profiles"
 
     @property
+    def benchmark_logs_dir(self) -> Path:
+        """Per-variant stdout/stderr logs of isolated benchmark workers."""
+        return self.artifacts_dir / "benchmark_logs"
+
+    @property
     def benchmarks_json(self) -> Path:
         """Structured benchmark output consumed by the README table."""
         return self.results_dir / "benchmarks.json"
+
+    @property
+    def benchmarks_md(self) -> Path:
+        """Markdown tables rendered from :attr:`benchmarks_json`."""
+        return self.results_dir / "benchmarks.md"
+
+    @property
+    def evaluation_json(self) -> Path:
+        """Accuracy / F1 results of the ``evaluate`` command."""
+        return self.results_dir / "evaluation.json"
+
+
+@dataclass(frozen=True, slots=True)
+class QuantizationConfig:
+    """Settings for ONNX Runtime dynamic INT8 quantization and FP16 conversion.
+
+    The INT8 defaults were chosen from a measured sweep on the full SST-2
+    validation split (README, "INT8 settings sweep"). Notably, per-channel
+    weights *without* ``reduce_range`` collapsed accuracy to ~49% on the
+    reference CPU: full-range s8 weights times u8 activations saturate the
+    int16 intermediate of AVX2 ``vpmaddubsw`` on CPUs without VNNI.
+
+    Attributes:
+        int8_per_channel: Quantize weights with one scale per output channel
+            instead of one per tensor.
+        int8_reduce_range: Quantize weights to 7 bits, preventing the int16
+            saturation described above (required for per-channel on non-VNNI
+            x86 CPUs).
+        int8_op_types: Operator types whose weights are quantized. ``MatMul``
+            covers every linear layer; ``Gather`` also quantizes the
+            word-embedding table (255.6 MB -> 64.5 MB with no measured
+            accuracy loss).
+        fp16_keep_io_types: Keep graph inputs/outputs in their original types
+            (int64 ids, float32 logits) so FP16 is a drop-in replacement.
+    """
+
+    int8_per_channel: bool = True
+    int8_reduce_range: bool = True
+    int8_op_types: tuple[str, ...] = ("MatMul", "Gather")
+    fp16_keep_io_types: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "int8_op_types", tuple(self.int8_op_types))
+        _require(len(self.int8_op_types) > 0, "int8_op_types must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,12 +222,16 @@ class PipelineConfig:
         device: Default execution target for the PyTorch baseline.
         attn_implementation: Attention kernel for baseline and export.
         opset_version: ONNX opset used by the exporter.
+        exporter: ONNX exporter backend (``torchscript`` or ``dynamo``).
         dataset_name: Hub dataset id for evaluation.
         dataset_config: Dataset configuration name.
         dataset_split: Split used for accuracy / F1 evaluation.
         eval_max_samples: Optional cap on evaluation samples (``None`` = all
             872 SST-2 validation sentences).
+        eval_batch_size: Batch size for accuracy evaluation (dynamic padding).
+        worker_timeout_s: Wall-clock limit for one isolated benchmark worker.
         tolerances: Numerical acceptance thresholds.
+        quantization: INT8 / FP16 conversion settings.
         paths: Filesystem layout.
     """
 
@@ -180,11 +245,15 @@ class PipelineConfig:
     device: DeviceName = "auto"
     attn_implementation: AttnImplementation = "sdpa"
     opset_version: int = 17
+    exporter: ExporterName = "torchscript"
     dataset_name: str = "nyu-mll/glue"
     dataset_config: str = "sst2"
     dataset_split: str = "validation"
     eval_max_samples: int | None = None
+    eval_batch_size: int = 32
+    worker_timeout_s: int = 1800
     tolerances: Tolerances = field(default_factory=Tolerances)
+    quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
 
     def __post_init__(self) -> None:
@@ -207,10 +276,13 @@ class PipelineConfig:
             f"invalid attn_implementation {self.attn_implementation!r}",
         )
         _require(self.opset_version >= 14, "opset_version must be >= 14")
+        _require(self.exporter in ("torchscript", "dynamo"), f"invalid exporter {self.exporter!r}")
         _require(
             self.eval_max_samples is None or self.eval_max_samples > 0,
             "eval_max_samples must be None or > 0",
         )
+        _require(self.eval_batch_size > 0, "eval_batch_size must be > 0")
+        _require(self.worker_timeout_s > 0, "worker_timeout_s must be > 0")
 
     def with_overrides(self, **overrides: Any) -> PipelineConfig:
         """Return a copy with the given fields replaced.
@@ -243,3 +315,33 @@ class PipelineConfig:
 
         result: dict[str, Any] = _convert(asdict(self))
         return result
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PipelineConfig:
+        """Inverse of :meth:`to_dict`: rebuild nested dataclasses and paths.
+
+        Used to hand the exact configuration to isolated benchmark workers.
+
+        Raises:
+            ConfigError: On unknown keys at any level or invalid values.
+        """
+        payload = dict(data)
+        nested: dict[str, Any] = {
+            "tolerances": _build(Tolerances, payload.pop("tolerances", {})),
+            "quantization": _build(QuantizationConfig, payload.pop("quantization", {})),
+            "paths": _build(PathsConfig, {k: Path(v) for k, v in payload.pop("paths", {}).items()}),
+        }
+        _check_keys(cls, payload)
+        if "batch_sizes" in payload:
+            payload["batch_sizes"] = tuple(payload["batch_sizes"])
+        return cls(**payload, **nested)
+
+
+def _check_keys(cls: type, payload: Mapping[str, Any]) -> None:
+    unknown = set(payload) - {f.name for f in fields(cls)}
+    _require(not unknown, f"unknown {cls.__name__} fields: {sorted(unknown)}")
+
+
+def _build(cls: type[_T], payload: Mapping[str, Any]) -> _T:
+    _check_keys(cls, payload)
+    return cls(**payload)

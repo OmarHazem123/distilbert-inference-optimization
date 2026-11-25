@@ -2,7 +2,8 @@
 # On Windows without `make`, run `python tasks.py <target>` instead.
 
 PYTHON ?= python
-TASKS  := setup doctor predict export lint fmt typecheck test check clean
+TASKS  := setup doctor predict export quantize benchmark profile evaluate report all \
+          lint fmt typecheck test test-fast check clean
 
 .PHONY: help $(TASKS)
 

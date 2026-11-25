@@ -37,9 +37,14 @@ from opt_pipeline.baseline import (
     encode,
     seed_everything,
 )
-from opt_pipeline.config import PipelineConfig
-from opt_pipeline.errors import ParityError, ProviderUnavailableError
-from opt_pipeline.utils import atomic_output, file_size_mb, get_logger
+from opt_pipeline.config import ExporterName, PipelineConfig
+from opt_pipeline.errors import (
+    ExportError,
+    MissingArtifactError,
+    ParityError,
+    ProviderUnavailableError,
+)
+from opt_pipeline.utils import atomic_output, file_size_mb, get_logger, utf8_stdio
 
 # NOTE on Windows CUDA DLLs: the ORT CUDA provider DLL is loaded lazily, at the
 # first CUDA session creation. ``import torch`` (above) has already loaded the
@@ -86,7 +91,12 @@ class _LogitsOnly(torch.nn.Module):
         return logits
 
 
-def export_onnx(cfg: PipelineConfig, output_path: Path | None = None) -> Path:
+def export_onnx(
+    cfg: PipelineConfig,
+    output_path: Path | None = None,
+    *,
+    exporter: ExporterName | None = None,
+) -> Path:
     """Export the FP32 model to ONNX with dynamic batch/sequence axes.
 
     The export runs on CPU in FP32 so the resulting graph is device-agnostic;
@@ -95,15 +105,18 @@ def export_onnx(cfg: PipelineConfig, output_path: Path | None = None) -> Path:
     Args:
         cfg: Pipeline configuration (model id, opset, max length, paths).
         output_path: Destination; defaults to ``cfg.paths.onnx_fp32``.
+        exporter: Override for ``cfg.exporter`` (``torchscript`` or ``dynamo``).
 
     Returns:
         Path to the validated ONNX file.
 
     Raises:
         onnx.checker.ValidationError: If the exported graph is malformed.
-        RuntimeError: If the written opset differs from ``cfg.opset_version``.
+        ExportError: If the written opset differs from ``cfg.opset_version``
+            (e.g. the dynamo exporter could not down-convert from opset 18).
     """
     output_path = output_path or cfg.paths.onnx_fp32
+    exporter = exporter or cfg.exporter
     seed_everything(cfg.seed)
 
     clf = TorchClassifier(cfg, device="cpu", precision="fp32")
@@ -114,30 +127,71 @@ def export_onnx(cfg: PipelineConfig, output_path: Path | None = None) -> Path:
     sample = clf.encode(["a short one", "a noticeably longer example sentence"], padding="longest")
     args = tuple(torch.from_numpy(sample[name]) for name in MODEL_INPUT_NAMES)
 
-    log.info("Exporting %s -> %s (opset %d)", cfg.model_id, output_path, cfg.opset_version)
+    log.info(
+        "Exporting %s -> %s (opset %d, %s exporter)",
+        cfg.model_id,
+        output_path,
+        cfg.opset_version,
+        exporter,
+    )
     with atomic_output(output_path) as tmp:
         # no_grad rather than inference_mode: the TorchScript tracer cannot
         # record ops on inference-mode tensors. Exporter warnings are captured
         # and summarised (see _log_export_warnings) instead of spamming stderr.
         with torch.no_grad(), warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            torch.onnx.export(
-                wrapper,
-                args,
-                str(tmp),
-                input_names=list(MODEL_INPUT_NAMES),
-                output_names=list(OUTPUT_NAMES),
-                dynamic_axes=DYNAMIC_AXES,
-                opset_version=cfg.opset_version,
-                do_constant_folding=True,
-                dynamo=False,  # TorchScript exporter: honours opset 17 + dynamic_axes
-            )
+            if exporter == "torchscript":
+                _export_torchscript(wrapper, args, tmp, cfg.opset_version)
+            elif exporter == "dynamo":
+                _export_dynamo(wrapper, args, tmp, cfg.opset_version)
+            else:  # pragma: no cover - guarded by PipelineConfig validation
+                raise ExportError(f"unknown exporter {exporter!r}")
         onnx.checker.check_model(str(tmp), full_check=True)
-        _assert_opset(tmp, cfg.opset_version)
+        _assert_opset(tmp, cfg.opset_version, exporter)
 
     _log_export_warnings(caught)
     log.info("Exported %.1f MB ONNX graph to %s", file_size_mb(output_path), output_path)
     return output_path
+
+
+def _export_torchscript(
+    model: torch.nn.Module, args: tuple[torch.Tensor, ...], path: Path, opset: int
+) -> None:
+    """Legacy TorchScript exporter: emits ``opset`` natively, honours ``dynamic_axes``."""
+    torch.onnx.export(
+        model,
+        args,
+        str(path),
+        input_names=list(MODEL_INPUT_NAMES),
+        output_names=list(OUTPUT_NAMES),
+        dynamic_axes=DYNAMIC_AXES,
+        opset_version=opset,
+        do_constant_folding=True,
+        dynamo=False,
+    )
+
+
+def _export_dynamo(
+    model: torch.nn.Module, args: tuple[torch.Tensor, ...], path: Path, opset: int
+) -> None:
+    """``torch.export``-based exporter.
+
+    It builds at opset 18 and runs the ONNX version converter to reach lower
+    opsets; :func:`_assert_opset` verifies the conversion actually happened.
+    ``dynamic_axes`` is translated to ``dynamic_shapes`` internally.
+    """
+    with utf8_stdio():
+        torch.onnx.export(
+            model,
+            args,
+            str(path),
+            input_names=list(MODEL_INPUT_NAMES),
+            output_names=list(OUTPUT_NAMES),
+            dynamic_axes=DYNAMIC_AXES,
+            opset_version=opset,
+            dynamo=True,
+            external_data=False,  # single self-contained file (< 2 GB)
+        )
 
 
 def _log_export_warnings(caught: list[warnings.WarningMessage]) -> None:
@@ -162,11 +216,16 @@ def _log_export_warnings(caught: list[warnings.WarningMessage]) -> None:
         log.debug("%s: %s (%s:%s)", w.category.__name__, w.message, w.filename, w.lineno)
 
 
-def _assert_opset(path: Path, expected: int) -> None:
+def _assert_opset(path: Path, expected: int, exporter: str) -> None:
     model = onnx.load(str(path), load_external_data=False)
     opsets = {imp.domain or "ai.onnx": imp.version for imp in model.opset_import}
     if opsets.get("ai.onnx") != expected:
-        raise RuntimeError(f"expected default-domain opset {expected}, got {opsets}")
+        raise ExportError(
+            f"{exporter} exporter produced default-domain opset {opsets.get('ai.onnx')}, "
+            f"expected {expected} (all imports: {opsets}). The dynamo exporter only "
+            "down-converts from opset 18 when the ONNX version converter succeeds; "
+            "use --exporter torchscript or --opset 18."
+        )
 
 
 def onnx_opset(path: Path) -> int:
@@ -360,7 +419,7 @@ def verify_parity(
     """
     onnx_path = onnx_path or cfg.paths.onnx_fp32
     if not onnx_path.exists():
-        raise FileNotFoundError(f"{onnx_path} not found -- run `opt-pipeline export` first")
+        raise MissingArtifactError(f"{onnx_path} not found -- run `opt-pipeline export` first")
     seed_everything(cfg.seed)
 
     ref = reference or TorchClassifier(cfg, device="cpu", precision="fp32")

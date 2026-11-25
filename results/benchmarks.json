@@ -1,0 +1,842 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-25T08:09:32+00:00",
+  "duration_s": 1303.3,
+  "opt_pipeline_version": "0.1.0",
+  "environment": {
+    "platform": "Windows-11-10.0.26300-SP0",
+    "python": "3.12.13",
+    "cpu": "Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz",
+    "cpu_physical_cores": 4,
+    "cpu_logical_cores": 8,
+    "ram_total_gb": 19.8,
+    "power_plugged": true,
+    "torch": "2.14.1+cu126",
+    "torch_cuda": "12.6",
+    "cudnn": 91002,
+    "torch_num_threads": 4,
+    "onnxruntime": "1.26.0",
+    "onnxruntime_providers": [
+      "TensorrtExecutionProvider",
+      "CUDAExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "onnx": "1.23.2",
+    "transformers": "5.24.1",
+    "numpy": "2.5.5",
+    "gpu": {
+      "name": "NVIDIA GeForce GTX 1650 Ti",
+      "compute_capability": "7.5",
+      "total_memory_mb": 4096,
+      "multiprocessors": 16,
+      "driver": "591.59"
+    }
+  },
+  "methodology": {
+    "timing_boundary": "host int64 numpy inputs -> host float32 logits (tokenisation excluded)",
+    "cuda_sync": "torch.cuda.synchronize() after every PyTorch CUDA iteration",
+    "padding": "max_length (128 tokens) for timed batches",
+    "warmup": "3 memory-pass + 10 untimed iterations",
+    "iterations": 100,
+    "gc_disabled_during_timing": true,
+    "isolation": "one subprocess per variant",
+    "seeding": "seed=42, deterministic algorithms off for benchmarking",
+    "ram": "peak RSS sampled every 2 ms during an untimed pass; delta vs pre-load RSS",
+    "vram_torch": "torch.cuda.max_memory_allocated/reserved (PyTorch variants only)",
+    "vram_device": "cudaMemGetInfo used-memory delta vs post-context baseline (all CUDA)",
+    "evaluation": "nyu-mll/glue/sst2 validation, dynamic padding, batch 32",
+    "int8_settings": {
+      "per_channel": true,
+      "reduce_range": true,
+      "op_types": [
+        "MatMul",
+        "Gather"
+      ]
+    }
+  },
+  "config": {
+    "model_id": "distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+    "revision": "714eb0fa89d2f80546fda750413ed43d93601a13",
+    "max_seq_length": 128,
+    "batch_sizes": [
+      1,
+      8,
+      32
+    ],
+    "warmup_runs": 10,
+    "benchmark_iters": 100,
+    "seed": 42,
+    "device": "auto",
+    "attn_implementation": "sdpa",
+    "opset_version": 17,
+    "exporter": "torchscript",
+    "dataset_name": "nyu-mll/glue",
+    "dataset_config": "sst2",
+    "dataset_split": "validation",
+    "eval_max_samples": null,
+    "eval_batch_size": 32,
+    "worker_timeout_s": 1800,
+    "tolerances": {
+      "fp32_atol": 0.0001,
+      "fp32_rtol": 0.001,
+      "fp16_max_abs_logit_diff": 0.05,
+      "min_label_agreement_fp16": 0.99,
+      "min_label_agreement_int8": 0.95,
+      "max_accuracy_drop_fp16": 0.005,
+      "max_accuracy_drop_int8": 0.02
+    },
+    "quantization": {
+      "int8_per_channel": true,
+      "int8_reduce_range": true,
+      "int8_op_types": [
+        "MatMul",
+        "Gather"
+      ],
+      "fp16_keep_io_types": true
+    },
+    "paths": {
+      "artifacts_dir": "artifacts",
+      "results_dir": "results",
+      "model_cache_dir": "models",
+      "data_cache_dir": "data"
+    }
+  },
+  "variants": [
+    {
+      "name": "pytorch-cpu-fp32",
+      "backend": "pytorch",
+      "device": "cpu",
+      "precision": "fp32",
+      "description": "PyTorch eager, FP32 (CPU baseline)",
+      "status": "ok",
+      "error": null,
+      "provider": "torch-cpu",
+      "artifact": "models/models--distilbert--distilbert-base-uncased-finetuned-sst-2-english/snapshots/714eb0fa89d2f80546fda750413ed43d93601a13/model.safetensors",
+      "model_size_mb": 255.4250316619873,
+      "load_seconds": 3.3213330999715254,
+      "threads": {
+        "torch_intra_op": 4,
+        "ort_intra_op": null
+      },
+      "ram_baseline_mb": 622.47265625,
+      "process_peak_ram_mb": 1131.4609375,
+      "vram_after_load_delta_mb": null,
+      "results": [
+        {
+          "batch_size": 1,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 73.5939779994078,
+            "std": 10.84696425260523,
+            "min": 64.7116000764072,
+            "p50": 71.8676500255242,
+            "p95": 78.09218495385721,
+            "p99": 128.99360698997052,
+            "max": 147.61620003264397
+          },
+          "throughput_samples_per_s": 13.588068306459082,
+          "ram_peak_mb": 926.0,
+          "ram_delta_mb": 303.52734375,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": null,
+          "speedup_p50_vs_device_baseline": 1.0
+        },
+        {
+          "batch_size": 8,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 573.2677730033174,
+            "std": 86.61138805923093,
+            "min": 475.9179000975564,
+            "p50": 540.3566000168212,
+            "p95": 772.5133449886926,
+            "p99": 821.422598952195,
+            "max": 886.5546000888571
+          },
+          "throughput_samples_per_s": 13.955084127768865,
+          "ram_peak_mb": 975.92578125,
+          "ram_delta_mb": 353.453125,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": null,
+          "speedup_p50_vs_device_baseline": 1.0
+        },
+        {
+          "batch_size": 32,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 1921.6266029968392,
+            "std": 75.74627761207162,
+            "min": 1772.4612000165507,
+            "p50": 1910.8109999797307,
+            "p95": 2065.9180649963673,
+            "p99": 2147.3616910143755,
+            "max": 2179.911999963224
+          },
+          "throughput_samples_per_s": 16.65255880101522,
+          "ram_peak_mb": 1122.140625,
+          "ram_delta_mb": 499.66796875,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": null,
+          "speedup_p50_vs_device_baseline": 1.0
+        }
+      ],
+      "eval": {
+        "n": 872,
+        "accuracy": 0.9105504587155964,
+        "f1": 0.9137168141592922,
+        "precision": 0.8978260869565218,
+        "recall": 0.9301801801801802,
+        "tp": 413,
+        "fp": 47,
+        "tn": 381,
+        "fn": 31,
+        "seconds": 18.723214700003155,
+        "label_agreement_vs_reference": 1.0,
+        "accuracy_drop_vs_reference": 0.0
+      },
+      "order": 0
+    },
+    {
+      "name": "ort-cpu-fp32",
+      "backend": "onnxruntime",
+      "device": "cpu",
+      "precision": "fp32",
+      "description": "ONNX Runtime CPU EP, FP32",
+      "status": "ok",
+      "error": null,
+      "provider": "CPUExecutionProvider",
+      "artifact": "artifacts/onnx/model_fp32.onnx",
+      "model_size_mb": 255.55862426757812,
+      "load_seconds": 2.760907099931501,
+      "threads": {
+        "torch_intra_op": 4,
+        "ort_intra_op": "ORT default (one per physical core)"
+      },
+      "ram_baseline_mb": 622.55078125,
+      "process_peak_ram_mb": 1111.66796875,
+      "vram_after_load_delta_mb": null,
+      "results": [
+        {
+          "batch_size": 1,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 56.860188000136986,
+            "std": 4.803026941987473,
+            "min": 43.829699978232384,
+            "p50": 57.39515001187101,
+            "p95": 63.110844971379265,
+            "p99": 63.72707597329282,
+            "max": 64.46719996165484
+          },
+          "throughput_samples_per_s": 17.58699777773494,
+          "ram_peak_mb": 914.4140625,
+          "ram_delta_mb": 291.86328125,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": null,
+          "speedup_p50_vs_device_baseline": 1.2521554523450127
+        },
+        {
+          "batch_size": 8,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 486.8072760058567,
+            "std": 20.858846797670747,
+            "min": 447.4946000846103,
+            "p50": 486.8892499944195,
+            "p95": 515.765439911047,
+            "p99": 533.689420996234,
+            "max": 583.0232000444084
+          },
+          "throughput_samples_per_s": 16.433608112101744,
+          "ram_peak_mb": 956.84765625,
+          "ram_delta_mb": 334.296875,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": null,
+          "speedup_p50_vs_device_baseline": 1.1098141929052951
+        },
+        {
+          "batch_size": 32,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 2063.9015970006585,
+            "std": 44.663130861014864,
+            "min": 1952.152300043963,
+            "p50": 2065.4310500249267,
+            "p95": 2131.900069990661,
+            "p99": 2203.0338260368444,
+            "max": 2208.669500076212
+          },
+          "throughput_samples_per_s": 15.50461516503676,
+          "ram_peak_mb": 1111.5625,
+          "ram_delta_mb": 489.01171875,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": null,
+          "speedup_p50_vs_device_baseline": 0.9251390889841954
+        }
+      ],
+      "eval": {
+        "n": 872,
+        "accuracy": 0.9105504587155964,
+        "f1": 0.9137168141592922,
+        "precision": 0.8978260869565218,
+        "recall": 0.9301801801801802,
+        "tp": 413,
+        "fp": 47,
+        "tn": 381,
+        "fn": 31,
+        "seconds": 18.73720149998553,
+        "label_agreement_vs_reference": 1.0,
+        "accuracy_drop_vs_reference": 0.0
+      },
+      "order": 1
+    },
+    {
+      "name": "ort-cpu-int8",
+      "backend": "onnxruntime",
+      "device": "cpu",
+      "precision": "int8",
+      "description": "ONNX Runtime CPU EP, dynamic INT8",
+      "status": "ok",
+      "error": null,
+      "provider": "CPUExecutionProvider",
+      "artifact": "artifacts/onnx/model_int8.onnx",
+      "model_size_mb": 64.48554420471191,
+      "load_seconds": 0.8713935000123456,
+      "threads": {
+        "torch_intra_op": 4,
+        "ort_intra_op": "ORT default (one per physical core)"
+      },
+      "ram_baseline_mb": 621.9296875,
+      "process_peak_ram_mb": 882.65234375,
+      "vram_after_load_delta_mb": null,
+      "results": [
+        {
+          "batch_size": 1,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 38.331304996972904,
+            "std": 2.2317708447254163,
+            "min": 31.501999939791858,
+            "p50": 38.68149995105341,
+            "p95": 40.755635022651404,
+            "p99": 42.540007927455015,
+            "max": 44.1742999246344
+          },
+          "throughput_samples_per_s": 26.088336937105897,
+          "ram_peak_mb": 725.00390625,
+          "ram_delta_mb": 103.07421875,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": null,
+          "speedup_p50_vs_device_baseline": 1.857933382016305
+        },
+        {
+          "batch_size": 8,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 329.66691900161095,
+            "std": 10.15709067980121,
+            "min": 304.8631000565365,
+            "p50": 329.1947999969125,
+            "p95": 344.24177499022335,
+            "p99": 352.45311489678,
+            "max": 372.3535999888554
+          },
+          "throughput_samples_per_s": 24.26691772479879,
+          "ram_peak_mb": 763.12890625,
+          "ram_delta_mb": 141.19921875,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": null,
+          "speedup_p50_vs_device_baseline": 1.6414493789752729
+        },
+        {
+          "batch_size": 32,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 1394.8724979918916,
+            "std": 52.77341534541801,
+            "min": 1295.5064999405295,
+            "p50": 1396.5138499625027,
+            "p95": 1475.9641599957831,
+            "p99": 1520.3608459653333,
+            "max": 1538.630900089629
+          },
+          "throughput_samples_per_s": 22.941164906518946,
+          "ram_peak_mb": 882.65234375,
+          "ram_delta_mb": 260.72265625,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": null,
+          "speedup_p50_vs_device_baseline": 1.3682721442619685
+        }
+      ],
+      "eval": {
+        "n": 872,
+        "accuracy": 0.9105504587155964,
+        "f1": 0.9135254988913525,
+        "precision": 0.8995633187772926,
+        "recall": 0.9279279279279279,
+        "tp": 412,
+        "fp": 46,
+        "tn": 382,
+        "fn": 32,
+        "seconds": 12.89457460003905,
+        "label_agreement_vs_reference": 0.9839449541284404,
+        "accuracy_drop_vs_reference": 0.0,
+        "tolerance": {
+          "min_label_agreement": 0.95,
+          "max_accuracy_drop": 0.02,
+          "passed": true
+        }
+      },
+      "order": 2
+    },
+    {
+      "name": "pytorch-cuda-fp32",
+      "backend": "pytorch",
+      "device": "cuda",
+      "precision": "fp32",
+      "description": "PyTorch eager, FP32 (GPU baseline)",
+      "status": "ok",
+      "error": null,
+      "provider": "torch-cuda",
+      "artifact": "models/models--distilbert--distilbert-base-uncased-finetuned-sst-2-english/snapshots/714eb0fa89d2f80546fda750413ed43d93601a13/model.safetensors",
+      "model_size_mb": 255.4250316619873,
+      "load_seconds": 0.9428503999952227,
+      "threads": {
+        "torch_intra_op": 4,
+        "ort_intra_op": null
+      },
+      "ram_baseline_mb": 723.45703125,
+      "process_peak_ram_mb": 1015.71875,
+      "vram_after_load_delta_mb": 292.0,
+      "results": [
+        {
+          "batch_size": 1,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 9.321996999206021,
+            "std": 0.5946799453162541,
+            "min": 8.458700031042099,
+            "p50": 9.109900041949004,
+            "p95": 10.352164978394285,
+            "p99": 10.885859002592042,
+            "max": 10.891700047068298
+          },
+          "throughput_samples_per_s": 107.27315188850335,
+          "ram_peak_mb": 940.76953125,
+          "ram_delta_mb": 217.3125,
+          "vram_torch_allocated_peak_mb": 293.64013671875,
+          "vram_torch_reserved_peak_mb": 326.0,
+          "vram_device_delta_mb": 368.0,
+          "speedup_p50_vs_device_baseline": 1.0
+        },
+        {
+          "batch_size": 8,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 51.16351299919188,
+            "std": 0.5967781404959617,
+            "min": 46.476999996230006,
+            "p50": 51.191799982916564,
+            "p95": 51.75565999816172,
+            "p99": 52.15829296968878,
+            "max": 53.41489997226745
+          },
+          "throughput_samples_per_s": 156.36142889809693,
+          "ram_peak_mb": 947.54296875,
+          "ram_delta_mb": 224.0859375,
+          "vram_torch_allocated_peak_mb": 321.63818359375,
+          "vram_torch_reserved_peak_mb": 370.0,
+          "vram_device_delta_mb": 412.0,
+          "speedup_p50_vs_device_baseline": 1.0
+        },
+        {
+          "batch_size": 32,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 224.43578099715523,
+            "std": 0.7228312302584978,
+            "min": 221.5935999993235,
+            "p50": 224.53140001744032,
+            "p95": 225.45721995993517,
+            "p99": 226.04730101651512,
+            "max": 226.28499998245388
+          },
+          "throughput_samples_per_s": 142.5797609357378,
+          "ram_peak_mb": 963.6171875,
+          "ram_delta_mb": 240.16015625,
+          "vram_torch_allocated_peak_mb": 421.06005859375,
+          "vram_torch_reserved_peak_mb": 490.0,
+          "vram_device_delta_mb": 532.0,
+          "speedup_p50_vs_device_baseline": 1.0
+        }
+      ],
+      "eval": {
+        "n": 872,
+        "accuracy": 0.9105504587155964,
+        "f1": 0.9137168141592922,
+        "precision": 0.8978260869565218,
+        "recall": 0.9301801801801802,
+        "tp": 413,
+        "fp": 47,
+        "tn": 381,
+        "fn": 31,
+        "seconds": 2.4653564000036567,
+        "label_agreement_vs_reference": 1.0,
+        "accuracy_drop_vs_reference": 0.0
+      },
+      "order": 3
+    },
+    {
+      "name": "pytorch-cuda-fp16",
+      "backend": "pytorch",
+      "device": "cuda",
+      "precision": "fp16",
+      "description": "PyTorch eager, FP16 weights+activations",
+      "status": "ok",
+      "error": null,
+      "provider": "torch-cuda",
+      "artifact": "models/models--distilbert--distilbert-base-uncased-finetuned-sst-2-english/snapshots/714eb0fa89d2f80546fda750413ed43d93601a13/model.safetensors",
+      "model_size_mb": 255.4250316619873,
+      "load_seconds": 0.9612451000139117,
+      "threads": {
+        "torch_intra_op": 4,
+        "ort_intra_op": null
+      },
+      "ram_baseline_mb": 724.17578125,
+      "process_peak_ram_mb": 1070.25,
+      "vram_after_load_delta_mb": 148.0,
+      "results": [
+        {
+          "batch_size": 1,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 34.922513000201434,
+            "std": 0.2833035610743388,
+            "min": 34.40140001475811,
+            "p50": 34.82230001827702,
+            "p95": 35.44200001633726,
+            "p99": 35.73064300348051,
+            "max": 35.784399951808155
+          },
+          "throughput_samples_per_s": 28.634823616336888,
+          "ram_peak_mb": 1050.53125,
+          "ram_delta_mb": 326.35546875,
+          "vram_torch_allocated_peak_mb": 165.4560546875,
+          "vram_torch_reserved_peak_mb": 182.0,
+          "vram_device_delta_mb": 224.0,
+          "speedup_p50_vs_device_baseline": 0.26161109510766184
+        },
+        {
+          "batch_size": 8,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 217.41262299823575,
+            "std": 0.24400505455824684,
+            "min": 216.9697000645101,
+            "p50": 217.3775999690406,
+            "p95": 217.89374499348924,
+            "p99": 218.2575790793635,
+            "max": 218.41390000190586
+          },
+          "throughput_samples_per_s": 36.796391532725856,
+          "ram_peak_mb": 1068.6171875,
+          "ram_delta_mb": 344.44140625,
+          "vram_torch_allocated_peak_mb": 180.5166015625,
+          "vram_torch_reserved_peak_mb": 202.0,
+          "vram_device_delta_mb": 244.0,
+          "speedup_p50_vs_device_baseline": 0.23549712569375783
+        },
+        {
+          "batch_size": 32,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 862.5823329971172,
+            "std": 0.24592858554109936,
+            "min": 862.0582000585273,
+            "p50": 862.5471500563435,
+            "p95": 863.0356250447221,
+            "p99": 863.2243109680712,
+            "max": 863.3046000031754
+          },
+          "throughput_samples_per_s": 37.09790796295725,
+          "ram_peak_mb": 1070.25,
+          "ram_delta_mb": 346.07421875,
+          "vram_torch_allocated_peak_mb": 229.9384765625,
+          "vram_torch_reserved_peak_mb": 270.0,
+          "vram_device_delta_mb": 312.0,
+          "speedup_p50_vs_device_baseline": 0.2603120304817811
+        }
+      ],
+      "eval": {
+        "n": 872,
+        "accuracy": 0.9105504587155964,
+        "f1": 0.9137168141592922,
+        "precision": 0.8978260869565218,
+        "recall": 0.9301801801801802,
+        "tp": 413,
+        "fp": 47,
+        "tn": 381,
+        "fn": 31,
+        "seconds": 9.872056500054896,
+        "label_agreement_vs_reference": 1.0,
+        "accuracy_drop_vs_reference": 0.0,
+        "tolerance": {
+          "min_label_agreement": 0.99,
+          "max_accuracy_drop": 0.005,
+          "passed": true
+        }
+      },
+      "order": 4
+    },
+    {
+      "name": "ort-cuda-fp32",
+      "backend": "onnxruntime",
+      "device": "cuda",
+      "precision": "fp32",
+      "description": "ONNX Runtime CUDA EP, FP32",
+      "status": "ok",
+      "error": null,
+      "provider": "CUDAExecutionProvider",
+      "artifact": "artifacts/onnx/model_fp32.onnx",
+      "model_size_mb": 255.55862426757812,
+      "load_seconds": 2.904782500001602,
+      "threads": {
+        "torch_intra_op": 4,
+        "ort_intra_op": "ORT default (one per physical core)"
+      },
+      "ram_baseline_mb": 723.7734375,
+      "process_peak_ram_mb": 1088.95703125,
+      "vram_after_load_delta_mb": 556.0,
+      "results": [
+        {
+          "batch_size": 1,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 7.140673003159463,
+            "std": 0.2917975096577213,
+            "min": 6.660299957729876,
+            "p50": 7.0196500164456666,
+            "p95": 7.821710064308718,
+            "p99": 7.984911024104805,
+            "max": 8.08499997947365
+          },
+          "throughput_samples_per_s": 140.04282223223774,
+          "ram_peak_mb": 957.453125,
+          "ram_delta_mb": 233.6796875,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": 590.0,
+          "speedup_p50_vs_device_baseline": 1.2977712593371877
+        },
+        {
+          "batch_size": 8,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 43.06168899522163,
+            "std": 0.6274090420526727,
+            "min": 37.53990004770458,
+            "p50": 43.04154991405085,
+            "p95": 43.50753006874584,
+            "p99": 44.4856200797949,
+            "max": 44.50739989988506
+          },
+          "throughput_samples_per_s": 185.77998649536775,
+          "ram_peak_mb": 964.52734375,
+          "ram_delta_mb": 240.75390625,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": 590.0,
+          "speedup_p50_vs_device_baseline": 1.189357727245902
+        },
+        {
+          "batch_size": 32,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 198.16956600407138,
+            "std": 0.7691468301110675,
+            "min": 196.28930010367185,
+            "p50": 198.18549999035895,
+            "p95": 199.39234005869366,
+            "p99": 199.55784702207893,
+            "max": 200.30500006396323
+          },
+          "throughput_samples_per_s": 161.47787294110822,
+          "ram_peak_mb": 980.05859375,
+          "ram_delta_mb": 256.28515625,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": 590.0,
+          "speedup_p50_vs_device_baseline": 1.1329355579916947
+        }
+      ],
+      "eval": {
+        "n": 872,
+        "accuracy": 0.9105504587155964,
+        "f1": 0.9137168141592922,
+        "precision": 0.8978260869565218,
+        "recall": 0.9301801801801802,
+        "tp": 413,
+        "fp": 47,
+        "tn": 381,
+        "fn": 31,
+        "seconds": 2.2136974999448285,
+        "label_agreement_vs_reference": 1.0,
+        "accuracy_drop_vs_reference": 0.0
+      },
+      "order": 5
+    },
+    {
+      "name": "ort-cuda-fp16",
+      "backend": "onnxruntime",
+      "device": "cuda",
+      "precision": "fp16",
+      "description": "ONNX Runtime CUDA EP, FP16 graph",
+      "status": "ok",
+      "error": null,
+      "provider": "CUDAExecutionProvider",
+      "artifact": "artifacts/onnx/model_fp16.onnx",
+      "model_size_mb": 127.90634536743164,
+      "load_seconds": 1.4822019999846816,
+      "threads": {
+        "torch_intra_op": 4,
+        "ort_intra_op": "ORT default (one per physical core)"
+      },
+      "ram_baseline_mb": 724.15625,
+      "process_peak_ram_mb": 1041.59375,
+      "vram_after_load_delta_mb": 196.0,
+      "results": [
+        {
+          "batch_size": 1,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 29.010833001229912,
+            "std": 0.17470140586963132,
+            "min": 28.66770001128316,
+            "p50": 28.97900005336851,
+            "p95": 29.258024913724512,
+            "p99": 29.719890987034887,
+            "max": 29.778400086797774
+          },
+          "throughput_samples_per_s": 34.469882335250595,
+          "ram_peak_mb": 1026.12109375,
+          "ram_delta_mb": 301.96484375,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": 230.0,
+          "speedup_p50_vs_device_baseline": 0.31436212516553247
+        },
+        {
+          "batch_size": 8,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 220.27172199683264,
+            "std": 1.3943988659067719,
+            "min": 219.93609995115548,
+            "p50": 220.11085000121966,
+            "p95": 220.39862996898592,
+            "p99": 221.04433994274592,
+            "max": 234.00739999487996
+          },
+          "throughput_samples_per_s": 36.31877904016674,
+          "ram_peak_mb": 1037.8359375,
+          "ram_delta_mb": 313.6796875,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": 358.0,
+          "speedup_p50_vs_device_baseline": 0.23257281493680526
+        },
+        {
+          "batch_size": 32,
+          "sequence_length": 128,
+          "warmup": 13,
+          "iterations": 100,
+          "latency_ms": {
+            "mean": 877.1735959989019,
+            "std": 0.11032458633178538,
+            "min": 876.9502000650391,
+            "p50": 877.1609999821521,
+            "p95": 877.3368649824988,
+            "p99": 877.3957630468067,
+            "max": 877.84750002902
+          },
+          "throughput_samples_per_s": 36.480806246292964,
+          "ram_peak_mb": 1041.59375,
+          "ram_delta_mb": 317.4375,
+          "vram_torch_allocated_peak_mb": null,
+          "vram_torch_reserved_peak_mb": null,
+          "vram_device_delta_mb": 358.0,
+          "speedup_p50_vs_device_baseline": 0.2559751288782891
+        }
+      ],
+      "eval": {
+        "n": 872,
+        "accuracy": 0.9105504587155964,
+        "f1": 0.9137168141592922,
+        "precision": 0.8978260869565218,
+        "recall": 0.9301801801801802,
+        "tp": 413,
+        "fp": 47,
+        "tn": 381,
+        "fn": 31,
+        "seconds": 10.024407699937,
+        "label_agreement_vs_reference": 1.0,
+        "accuracy_drop_vs_reference": 0.0,
+        "tolerance": {
+          "min_label_agreement": 0.99,
+          "max_accuracy_drop": 0.005,
+          "passed": true
+        }
+      },
+      "order": 6
+    }
+  ]
+}

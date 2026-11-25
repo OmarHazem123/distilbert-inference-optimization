@@ -33,6 +33,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from transformers import (
+    AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     PreTrainedModel,
@@ -119,6 +120,14 @@ def load_tokenizer(cfg: PipelineConfig) -> PreTrainedTokenizerBase:
         cache_dir=str(cfg.paths.model_cache_dir),
     )
     return tokenizer
+
+
+def load_id2label(cfg: PipelineConfig) -> dict[int, str]:
+    """Read the label mapping from the model config without loading weights."""
+    config = AutoConfig.from_pretrained(
+        cfg.model_id, revision=cfg.revision, cache_dir=str(cfg.paths.model_cache_dir)
+    )
+    return {int(k): str(v) for k, v in (config.id2label or {}).items()}
 
 
 def load_model(
@@ -277,6 +286,11 @@ class TorchClassifier:
         """
         logits: torch.Tensor = self.model(**inputs).logits
         return logits
+
+    @property
+    def device_type(self) -> str:
+        """``"cpu"`` or ``"cuda"`` (part of the benchmark ``Runner`` protocol)."""
+        return self.device.type
 
     def synchronize(self) -> None:
         """Block until all queued CUDA work has finished (no-op on CPU)."""

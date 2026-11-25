@@ -1,0 +1,118 @@
+{
+  "generated_at": "2026-11-25T08:41:06+00:00",
+  "cpu": "Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz",
+  "dataset": "nyu-mll/glue/sst2:validation",
+  "n": 872,
+  "reference": {
+    "accuracy": 0.9105504587155964,
+    "f1": 0.9137168141592922
+  },
+  "ort_fp32_rough_bs8_p50_ms": 539.2406499595381,
+  "rows": [
+    {
+      "label": "matmul / per-channel",
+      "settings": {
+        "int8_per_channel": true,
+        "int8_reduce_range": false,
+        "int8_op_types": [
+          "MatMul"
+        ],
+        "fp16_keep_io_types": true
+      },
+      "size_mb": 132.67446327209473,
+      "accuracy": 0.4896788990825688,
+      "f1": 0.00447427293064877,
+      "accuracy_drop": 0.4208715596330276,
+      "label_agreement": 0.4713302752293578,
+      "rough_bs8_p50_ms": 391.25505002448335
+    },
+    {
+      "label": "matmul+gather / per-channel",
+      "settings": {
+        "int8_per_channel": true,
+        "int8_reduce_range": false,
+        "int8_op_types": [
+          "MatMul",
+          "Gather"
+        ],
+        "fp16_keep_io_types": true
+      },
+      "size_mb": 64.48554420471191,
+      "accuracy": 0.49311926605504586,
+      "f1": 0.013392857142857142,
+      "accuracy_drop": 0.4174311926605505,
+      "label_agreement": 0.47477064220183485,
+      "rough_bs8_p50_ms": 392.29415002046153
+    },
+    {
+      "label": "matmul / per-tensor",
+      "settings": {
+        "int8_per_channel": false,
+        "int8_reduce_range": false,
+        "int8_op_types": [
+          "MatMul"
+        ],
+        "fp16_keep_io_types": true
+      },
+      "size_mb": 132.47286224365234,
+      "accuracy": 0.8979357798165137,
+      "f1": 0.9018743109151047,
+      "accuracy_drop": 0.012614678899082632,
+      "label_agreement": 0.9782110091743119,
+      "rough_bs8_p50_ms": 385.30289998743683
+    },
+    {
+      "label": "matmul+gather / per-tensor",
+      "settings": {
+        "int8_per_channel": false,
+        "int8_reduce_range": false,
+        "int8_op_types": [
+          "MatMul",
+          "Gather"
+        ],
+        "fp16_keep_io_types": true
+      },
+      "size_mb": 64.28394317626953,
+      "accuracy": 0.9013761467889908,
+      "f1": 0.9050772626931568,
+      "accuracy_drop": 0.00917431192660556,
+      "label_agreement": 0.9747706422018348,
+      "rough_bs8_p50_ms": 383.77635000506416
+    },
+    {
+      "label": "matmul / per-channel / reduce_range",
+      "settings": {
+        "int8_per_channel": true,
+        "int8_reduce_range": true,
+        "int8_op_types": [
+          "MatMul"
+        ],
+        "fp16_keep_io_types": true
+      },
+      "size_mb": 132.67446327209473,
+      "accuracy": 0.9025229357798165,
+      "f1": 0.9058693244739756,
+      "accuracy_drop": 0.008027522935779907,
+      "label_agreement": 0.9873853211009175,
+      "rough_bs8_p50_ms": 385.03674999810755
+    },
+    {
+      "label": "matmul+gather / per-channel / reduce_range",
+      "settings": {
+        "int8_per_channel": true,
+        "int8_reduce_range": true,
+        "int8_op_types": [
+          "MatMul",
+          "Gather"
+        ],
+        "fp16_keep_io_types": true
+      },
+      "size_mb": 64.48554420471191,
+      "accuracy": 0.9105504587155964,
+      "f1": 0.9135254988913525,
+      "accuracy_drop": 0.0,
+      "label_agreement": 0.9839449541284404,
+      "rough_bs8_p50_ms": 391.58305001910776
+    }
+  ]
+}

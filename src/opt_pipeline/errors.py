@@ -27,3 +27,11 @@ class ProviderUnavailableError(PipelineError, RuntimeError):
 
 class ParityError(PipelineError, AssertionError):
     """Optimized-model outputs diverge from the reference beyond tolerance."""
+
+
+class ExportError(PipelineError, RuntimeError):
+    """ONNX export or conversion produced an unusable graph."""
+
+
+class MissingArtifactError(PipelineError, FileNotFoundError):
+    """A required artifact (e.g. an ONNX graph) has not been generated yet."""

@@ -26,6 +26,9 @@ htmlcov/
 *.onnx
 *.onnx.data
 *.tmp
+# Debug dumps ORT writes to the CWD when symbolic shape inference fails
+# (sym_shape_infer_temp.onnx + a <uuid>.data weights file).
+/*.data
 
 # --- Downloaded models & datasets (Hugging Face caches) ------------------
 /models/

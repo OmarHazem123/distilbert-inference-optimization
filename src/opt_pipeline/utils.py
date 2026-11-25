@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import sys
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -76,6 +78,31 @@ def atomic_write_text(path: str | os.PathLike[str], text: str) -> Path:
 def atomic_write_json(path: str | os.PathLike[str], payload: Any, *, indent: int = 2) -> Path:
     """Atomically serialise ``payload`` as pretty-printed JSON."""
     return atomic_write_text(path, json.dumps(payload, indent=indent, sort_keys=False) + "\n")
+
+
+@contextmanager
+def utf8_stdio() -> Iterator[None]:
+    """Temporarily switch stdout/stderr to UTF-8 (an in-process ``PYTHONUTF8=1``).
+
+    On Windows, Python encodes console/pipe output with the ANSI code page
+    (cp1252), so printing e.g. the dynamo exporter's emoji progress markers or
+    the report's delta / multiplication / check-mark symbols raises
+    ``UnicodeEncodeError``. Streams are
+    reconfigured to UTF-8 with ``backslashreplace`` and restored afterwards.
+    Streams that are already UTF-8, or are not plain ``TextIOWrapper``s (e.g.
+    pytest capture objects), are left alone.
+    """
+    restore: list[tuple[io.TextIOWrapper, str, str | None]] = []
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if encoding != "utf8" and isinstance(stream, io.TextIOWrapper):
+            restore.append((stream, stream.encoding, stream.errors))
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    try:
+        yield
+    finally:
+        for stream, encoding, errors in restore:
+            stream.reconfigure(encoding=encoding, errors=errors)
 
 
 def file_size_mb(path: str | os.PathLike[str]) -> float:
