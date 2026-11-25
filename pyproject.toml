@@ -1,0 +1,98 @@
+[project]
+name = "opt-pipeline"
+version = "0.1.0"
+description = "Inference optimization & benchmarking pipeline for DistilBERT SST-2 (PyTorch vs ONNX Runtime FP32/FP16/INT8)."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Omar Hazem", email = "OmarHazem123@users.noreply.github.com" }]
+# Pinned to 3.11/3.12: these are the interpreters with CUDA 12.x wheels for
+# both torch (cu126 index) and onnxruntime-gpu 1.26 on Windows.
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # Sourced from the CUDA 12.6 index below -- never from PyPI's CPU build.
+    "torch>=2.6",
+    "transformers>=4.46",
+    "onnx>=1.17",
+    "onnxscript>=0.2",
+    # 1.26.x is the last PyPI release built against CUDA 12 + cuDNN 9;
+    # 1.27+ moved to CUDA 13. Do NOT also install the CPU-only `onnxruntime`
+    # package: both write the same `onnxruntime/` module and the last one wins.
+    "onnxruntime-gpu>=1.24,<1.27",
+    "datasets>=3.0",
+    "numpy>=1.26",
+    "psutil>=6.0",
+]
+
+[project.scripts]
+opt-pipeline = "opt_pipeline.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-psutil",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opt_pipeline"]
+
+# ---------------------------------------------------------------------------
+# uv: bind torch to the CUDA 12.6 wheel index so a later `uv sync` / `uv add`
+# can never silently replace it with the CPU build from PyPI.
+# ---------------------------------------------------------------------------
+[tool.uv]
+# The project targets NVIDIA GPUs; skip resolving for macOS.
+environments = ["sys_platform == 'win32'", "sys_platform == 'linux'"]
+# Copy instead of hardlink: on Windows the uv cache often lives on another
+# drive, where hardlinks fail and uv warns on every `uv run`.
+link-mode = "copy"
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true  # only packages listed in [tool.uv.sources] may come from here
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126" }]
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PTH", "N"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["opt_pipeline"]
+
+[[tool.mypy.overrides]]
+module = ["onnxruntime.*", "onnx.*", "datasets.*"]
+ignore_missing_imports = true
+
+# transformers 5 ships partial inline hints (decorated `PreTrainedModel.to`,
+# untyped `eval`, Optional config fields) that produce false positives under
+# --strict. Treat it as untyped rather than sprinkling `type: ignore`s.
+[[tool.mypy.overrides]]
+module = ["transformers", "transformers.*"]
+follow_imports = "skip"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: downloads the model or runs full inference (deselect with -m 'not slow')",
+    "gpu: requires a CUDA-capable GPU",
+]

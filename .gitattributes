@@ -1,0 +1,7 @@
+# Normalise line endings: LF in the repo and working tree on every OS
+# (keeps Makefile tabs / shell-style files consistent with core.autocrlf=true).
+* text=auto eol=lf
+
+# Binary artifacts (should be git-ignored anyway).
+*.onnx binary
+*.safetensors binary

@@ -1,0 +1,41 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- Environments ---------------------------------------------------------
+.venv/
+.env
+
+# --- Tool caches ----------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Claude Code local state ---------------------------------------------
+.claude/
+
+# --- Pipeline outputs (regenerable, large) --------------------------------
+# Exported / quantized ONNX graphs, profiler traces, temp files.
+# Leading "/" anchors to the repo root so e.g. tests/data/ is NOT ignored.
+/artifacts/
+*.onnx
+*.onnx.data
+*.tmp
+
+# --- Downloaded models & datasets (Hugging Face caches) ------------------
+/models/
+/data/
+
+# NOTE: results/ is intentionally tracked -- results/benchmarks.json is the
+# source of truth for the numbers reported in README.md.
+
+# --- OS / editor noise ----------------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
