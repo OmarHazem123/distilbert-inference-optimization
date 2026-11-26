@@ -4,8 +4,8 @@ An end-to-end, reproducible pipeline that takes
 [`distilbert-base-uncased-finetuned-sst-2-english`](https://huggingface.co/distilbert/distilbert-base-uncased-finetuned-sst-2-english)
 from a PyTorch baseline to optimized ONNX Runtime variants (FP32, FP16, INT8). It
 measures the speed-vs-accuracy trade-off of each variant **on real hardware**. Every
-number below comes from `results/benchmarks.json`, produced by this code on the machine
-described.
+number and chart below comes from the JSON files in `results/`, produced by this code on
+the machine described.
 
 | | |
 |---|---|
@@ -13,6 +13,11 @@ described.
 | **Backends** | PyTorch (CPU/CUDA, FP32/FP16) and ONNX Runtime 1.26 (CPU EP, CUDA EP) |
 | **Optimizations** | ONNX export (opset 17, dynamic axes), dynamic INT8 quantization, FP16 graph conversion |
 | **Metrics** | p50/p95/p99 latency, throughput, peak RAM/VRAM, model size, SST-2 accuracy, F1, label agreement |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/latency_padding-dark.png">
+  <img src="docs/figures/latency_padding-light.png" alt="Batch-1 p50 latency for all 7 variants, padded to 128 tokens versus padded per batch. Padding per batch is 1.8 to 4.6 times faster: ORT INT8 on CPU drops from 38.7 to 8.3 ms and ORT CUDA FP32 from 7.0 to 3.5 ms.">
+</picture>
 
 ## Key findings
 
@@ -86,8 +91,9 @@ python tasks.py export     # FP32 ONNX (opset 17) + parity check on CPU and CUDA
 python tasks.py quantize   # INT8 (dynamic) + FP16 graphs, verified on all of SST-2 validation
 python tasks.py benchmark  # all 7 variants, isolated workers; rewrites the tables below
 python tasks.py benchmark-dynamic  # same on real SST-2 lengths (dynamic padding), ~10 min
+python tasks.py figures    # redraw the README charts (docs/figures/) from results/*.json
 python tasks.py profile    # torch.profiler Chrome trace + top-10 operators
-python tasks.py all        # doctor -> export -> quantize -> benchmark(-dynamic) -> profile
+python tasks.py all        # doctor -> export -> quantize -> benchmark(-dynamic) -> figures -> profile
 ```
 
 Extra CLI flags go after `--`, e.g. `python tasks.py benchmark -- --variants ort-cpu-int8`.
@@ -108,6 +114,7 @@ If you do have `make`, `make benchmark` and similar targets call the same tasks.
 | `opt-pipeline profile` | Runs `torch.profiler` and prints the top operators by self time (`--device`, `--precision`, `--batch-size`) |
 | `opt-pipeline evaluate` | Reports SST-2 accuracy, F1 and label agreement per variant (in-process) |
 | `opt-pipeline report` | Re-renders `results/*.md` and the README tables from each results JSON (`--input` for one file) |
+| `opt-pipeline figures` | Draws the README charts from the results JSON as light and dark PNGs in `docs/figures/` (`--output-dir`). Needs matplotlib, a dev dependency |
 
 Variants: `pytorch-cpu-fp32`, `ort-cpu-fp32`, `ort-cpu-int8`, `pytorch-cuda-fp32`,
 `pytorch-cuda-fp16`, `ort-cuda-fp32`, `ort-cuda-fp16`.
@@ -115,6 +122,15 @@ Variants: `pytorch-cpu-fp32`, `ort-cpu-fp32`, `ort-cpu-int8`, `pytorch-cuda-fp32
 ---
 
 ## Results
+
+Throughput for every variant, batch size and padding mode. The tables below add latency
+percentiles, memory and accuracy. `python tasks.py figures` redraws every chart in this
+README from the results files, so re-run it after a benchmark.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/throughput-dark.png">
+  <img src="docs/figures/throughput-light.png" alt="Throughput in samples per second by batch size. Padded to 128 tokens, every CPU variant stays below 27 samples/s and GPU FP32 peaks at 186 (ORT, batch 8). Padded per batch, ORT INT8 on CPU reaches 107 at batch 1 and falls as batches grow, and GPU FP32 levels off from batch 8 at 395 to 459 samples/s. FP16 (dashed) stays far below FP32 on the GPU.">
+</picture>
 
 ### Benchmarks
 
@@ -174,6 +190,11 @@ tokens, and the longest is 55, so at fixed 128 about 80% of every batch is paddi
 same batches, and pads each batch only to its own longest sentence. Results go to
 `results/benchmarks_dynamic.json`, and the published fixed-padding results stay as they
 are.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/padding_tokens-dark.png">
+  <img src="docs/figures/padding_tokens-light.png" alt="Mean tokens computed per sentence. Padded to 128 tokens, only 19.6 to 19.7% are real tokens at every batch size. Padded per batch, the real share is 100% at batch 1, 61.3% at batch 8 and 53.0% at batch 32.">
+</picture>
 
 <!-- BENCHMARKS-DYNAMIC:START -->
 _Generated 2026-11-25T09:25:58+00:00 from `results/benchmarks_dynamic.json` (schema v2). CPU: Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz (4C/8T, 19.8 GB RAM, on AC power). GPU: NVIDIA GeForce GTX 1650 Ti (4096 MB, driver 591.59). torch 2.14.1+cu126, onnxruntime 1.26.0. 100 timed batches per cell, drawn (seed 42) from the validation sentences; each batch is padded to its longest sentence._
@@ -336,6 +357,11 @@ methodology.
 
 (ORT FP32 measured the same way: 539 ms.)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/figures/int8_sweep-dark.png">
+  <img src="docs/figures/int8_sweep-light.png" alt="SST-2 accuracy for six INT8 settings. Per-channel weights without reduce_range collapse to 48.97% and 49.31%. Per-tensor weights reach 89.79% and 90.14%. Per-channel with reduce_range reaches 90.25% for MatMul only and 91.06% for MatMul+Gather, the shipped default, which equals PyTorch FP32.">
+</picture>
+
 With per-channel weights at full 8-bit range, the model **collapses** to predicting one
 class. This CPU has AVX2 but no VNNI. ORT's u8×s8 integer GEMM there accumulates pairwise
 products in int16 (`vpmaddubsw`), which saturates when weights use the full s8 range.
@@ -437,12 +463,15 @@ src/opt_pipeline/
   benchmark.py           Fixed / dynamic-padding workloads, latency / throughput / memory
                          measurement, isolated workers, results schema, Markdown report
   profile_bottlenecks.py torch.profiler trace + top-N operators
+  figures.py             README charts from the results JSON (matplotlib, light + dark PNGs)
   cli.py                 `opt-pipeline` CLI
 tests/
   test_parity.py         Shapes, FP32 equivalence, dynamic seq len, INT8/FP16 tolerance,
                          CUDA EP, dynamo exporter
   test_benchmark.py      Latency/memory collection, workloads, JSON schema, comparisons,
                          report, config, CLI, LF output
+  test_figures.py        Every chart renders from the tracked results, byte-identically
+docs/figures/            Generated README charts (`python tasks.py figures`)
 scripts/int8_sweep.py    Reproduces the INT8 settings sweep -> results/int8_sweep.json
 tasks.py                 Cross-platform task runner (make replacement)
 Makefile                 Thin wrapper around tasks.py
@@ -452,19 +481,21 @@ Generated and git-ignored: `.venv/`, `models/` (HF model cache), `data/` (proces
 Arrow cache), and `artifacts/` (ONNX graphs, profiler traces, worker logs). The raw SST-2
 parquet files (~3 MB) always go to the shared `~/.cache/huggingface/hub`; datasets 5.x
 ignores `DownloadConfig.cache_dir` for Hub files. `results/` is tracked: `benchmarks.json`
-and `benchmarks_dynamic.json` (each + `.md`), `evaluation.json` and `int8_sweep.json`.
+and `benchmarks_dynamic.json` (each + `.md`), `evaluation.json` and `int8_sweep.json`. So
+are the charts drawn from them in `docs/figures/`.
 
 ## Testing
 
 ```bash
-python tasks.py test-fast   # 54 fast tests: metrics, workloads, schema, report, config, CLI (~6 s)
-python tasks.py test        # all 84: + export, INT8/FP16 parity, GPU, workers, profiler (~3 min)
+python tasks.py test-fast   # 61 fast tests: metrics, workloads, schema, report, figures, config, CLI (~10 s)
+python tasks.py test        # all 91: + export, INT8/FP16 parity, GPU, workers, profiler (~3 min)
 python tasks.py check       # ruff + mypy --strict + full pytest
 ```
 
 Slow tests are marked `slow`, and GPU tests are marked `gpu` and skip without CUDA. Tests
 write only to pytest temp directories; they share the `models/` and `data/` caches but never
-touch `artifacts/` or `results/`.
+write to `artifacts/`, `results/` or `docs/`. The figure tests read the tracked `results/`
+files as input.
 
 ---
 

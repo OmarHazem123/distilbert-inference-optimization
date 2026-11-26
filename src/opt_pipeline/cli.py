@@ -10,6 +10,7 @@ Commands:
     profile   torch.profiler trace + top-10 operators of the PyTorch baseline.
     evaluate  SST-2 validation accuracy / F1 / label agreement per variant.
     report    Re-render the Markdown tables (and README) from the results JSON files.
+    figures   Render the README charts (docs/figures/*.png) from the results JSON files.
 
 Heavy imports (torch, onnxruntime, transformers) happen inside each command so
 ``--help`` stays fast.
@@ -28,6 +29,7 @@ from typing import Any
 from opt_pipeline import __version__
 from opt_pipeline.config import PipelineConfig
 from opt_pipeline.errors import PipelineError
+from opt_pipeline.figures import DEFAULT_FIGURES_DIR  # light: matplotlib loads lazily
 from opt_pipeline.utils import atomic_write_json, get_logger, utf8_stdio
 
 log = get_logger("opt_pipeline.cli")
@@ -365,6 +367,14 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_figures(args: argparse.Namespace) -> int:
+    from opt_pipeline.figures import load_figure_inputs, render_figures
+
+    for path in render_figures(load_figure_inputs(), args.output_dir):
+        print(path.as_posix())
+    return 0
+
+
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
@@ -461,6 +471,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--update-readme", action="store_true", help="splice tables into README")
     p.add_argument("--readme", type=Path, default=DEFAULT_README, help=argparse.SUPPRESS)
     p.set_defaults(func=_cmd_report)
+
+    p = sub.add_parser("figures", help="render the README charts from the results JSON")
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_FIGURES_DIR,
+        help=f"where the PNGs go (default {DEFAULT_FIGURES_DIR.as_posix()})",
+    )
+    p.set_defaults(func=_cmd_figures)
 
     return parser
 

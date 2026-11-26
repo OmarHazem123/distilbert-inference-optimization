@@ -33,6 +33,7 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "types-psutil",
+    "matplotlib>=3.11.2",
 ]
 
 [build-system]

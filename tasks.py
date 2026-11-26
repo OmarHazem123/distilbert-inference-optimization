@@ -121,12 +121,18 @@ def report(extra: list[str]) -> None:
     uv_run("opt-pipeline", "report", "--update-readme", *extra)
 
 
+@task("Render the README charts (docs/figures/*.png) from the results JSON files")
+def figures(extra: list[str]) -> None:
+    uv_run("opt-pipeline", "figures", *extra)
+
+
 @task(
-    "Full pipeline: doctor -> export -> quantize -> benchmark -> benchmark-dynamic -> profile",
+    "Full pipeline: doctor -> export -> quantize -> benchmark -> benchmark-dynamic -> figures "
+    "-> profile",
     name="all",
 )
 def run_all(extra: list[str]) -> None:
-    for step in (doctor, export, quantize, benchmark, benchmark_dynamic, profile):
+    for step in (doctor, export, quantize, benchmark, benchmark_dynamic, figures, profile):
         step([])
 
 

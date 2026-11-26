@@ -188,6 +188,11 @@ class PathsConfig:
         """Accuracy / F1 results of the ``evaluate`` command."""
         return self.results_dir / "evaluation.json"
 
+    @property
+    def int8_sweep_json(self) -> Path:
+        """INT8 settings sweep written by ``scripts/int8_sweep.py``."""
+        return self.results_dir / "int8_sweep.json"
+
 
 @dataclass(frozen=True, slots=True)
 class QuantizationConfig:

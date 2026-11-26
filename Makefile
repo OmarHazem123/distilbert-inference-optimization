@@ -3,7 +3,7 @@
 
 PYTHON ?= python
 TASKS  := setup doctor predict export quantize benchmark benchmark-dynamic profile \
-          evaluate report all \
+          evaluate report figures all \
           lint fmt typecheck test test-fast check clean
 
 .PHONY: help $(TASKS)

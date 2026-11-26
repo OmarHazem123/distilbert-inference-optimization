@@ -94,7 +94,7 @@ def main() -> int:
         "ort_fp32_rough_bs8_p50_ms": fp32_p50,
         "rows": rows,
     }
-    output = cfg.paths.results_dir / "int8_sweep.json"
+    output = cfg.paths.int8_sweep_json
     atomic_write_json(output, payload)
 
     with utf8_stdio():

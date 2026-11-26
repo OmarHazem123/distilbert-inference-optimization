@@ -5,3 +5,6 @@
 # Binary artifacts (should be git-ignored anyway).
 *.onnx binary
 *.safetensors binary
+
+# README charts (docs/figures/), tracked: never line-ending converted or diffed as text.
+*.png binary
